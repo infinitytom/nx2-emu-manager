@@ -10,7 +10,34 @@ Add-Type -AssemblyName System.Xaml
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-$script:AppVersion = '2.3.0'
+# 只允许一个实例，防止旧窗口覆盖新数据
+$script:Mutex = New-Object System.Threading.Mutex($false, 'Local\NX2EmuManager')
+$gotMutex = $false
+try { $gotMutex = $script:Mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $gotMutex = $true }
+if (-not $gotMutex) {
+    [void][System.Windows.MessageBox]::Show('NX2 Emu Manager 已经在运行了（可能在任务栏或被其它窗口挡住）。', 'NX2 Emu Manager', 'OK', 'Information')
+    return
+}
+
+# 游戏列表项使用强类型对象，保证 WPF 能直接绑定图片
+if (-not ('EmuMgr.GameItem' -as [type])) {
+    Add-Type -Language CSharp -TypeDefinition @'
+namespace EmuMgr {
+    public class GameItem {
+        public string Name { get; set; }
+        public string TitleId { get; set; }
+        public string Tags { get; set; }
+        public string Initial { get; set; }
+        public string TileBg { get; set; }
+        public string CoverVis { get; set; }
+        public object Cover { get; set; }
+        public object Game { get; set; }
+    }
+}
+'@
+}
+
+$script:AppVersion = '2.4.0'
 
 # ================================================================ 路径与持久化
 $script:AppRoot    = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -64,6 +91,7 @@ Ensure-Key $Cfg 'EmuScanDepth'  3
 Ensure-Key $Cfg 'GameScanDepth' 5
 Ensure-Key $Cfg 'CoverUrls'     @('https://tinfoil.media/ti/{TID}/256/256/')
 Ensure-Key $Cfg 'AutoCovers'    $true
+Ensure-Key $Cfg 'SharedDataDirs' @{}
 Write-Json $ConfigPath $Cfg
 
 $script:Db = Read-Json $DbPath
@@ -424,6 +452,35 @@ function Get-ProfileAppData($prof, [string]$exeName) {
     } elseif ($m) { return [string]$m }
     return [IO.Path]::GetFileNameWithoutExtension($exeName)
 }
+function Resolve-RealPath([string]$p) {
+    try {
+        $it = Get-Item -LiteralPath $p -Force -ErrorAction Stop
+        if ($it.LinkType -and $it.Target) {
+            $t = [string](@($it.Target)[0])
+            if ($t -and -not [IO.Path]::IsPathRooted($t)) { $t = Join-Path ([IO.Path]::GetDirectoryName($p)) $t }
+            if ($t) { return $t.TrimEnd('\') }
+        }
+    } catch { }
+    return $p
+}
+function Test-DataDir([string]$d) {
+    return ($d -and [IO.Directory]::Exists($d) -and ([IO.Directory]::Exists((Join-Path $d 'nand')) -or [IO.Directory]::Exists((Join-Path $d 'keys'))))
+}
+$script:DataDirGuess = @{}
+function Find-DataDirCandidate([string]$appName) {
+    if ($script:DataDirGuess.ContainsKey($appName)) { return $script:DataDirGuess[$appName] }
+    $found = $null
+    foreach ($drv in [IO.DriveInfo]::GetDrives()) {
+        try { if (-not $drv.IsReady -or $drv.DriveType -ne 'Fixed') { continue } } catch { continue }
+        $r = $drv.RootDirectory.FullName
+        foreach ($c in @((Join-Path $r $appName), (Join-Path $r "$appName\$appName"), (Join-Path $r "$appName\user"))) {
+            if (Test-DataDir $c) { $found = $c; break }
+        }
+        if ($found) { break }
+    }
+    $script:DataDirGuess[$appName] = $found
+    return $found
+}
 function Get-EmuInfo([string]$dir) {
     $prof = Get-DirProfile $dir
     if (-not $prof) { throw "不是模拟器目录：$dir" }
@@ -455,12 +512,28 @@ function Get-EmuInfo([string]$dir) {
     }
     $pdir = [string]$prof.portableDir; if (-not $pdir) { $pdir = 'user' }
     $portable = [IO.Directory]::Exists((Join-Path $dir $pdir))
-    $dataDir = if ($portable) { Join-Path $dir $pdir } else { Join-Path $env:APPDATA (Get-ProfileAppData $prof ([IO.Path]::GetFileName($main))) }
+    $appName = Get-ProfileAppData $prof ([IO.Path]::GetFileName($main))
+    $key = $dir.TrimEnd('\').ToLower()
+    $dataSrc = ''
+    $em = $script:Db.emus[$key]
+    $shared = $script:Cfg.SharedDataDirs
+    if ($em -and $em.dataDir) { $dataDir = [string]$em.dataDir; $dataSrc = '自定义' }
+    elseif ($portable) { $dataDir = Join-Path $dir $pdir; $dataSrc = '独立' }
+    elseif ($shared -and $shared[$appName]) { $dataDir = [string]$shared[$appName]; $dataSrc = '共享·指定' }
+    else {
+        $def = Join-Path $env:APPDATA $appName
+        $dataDir = Resolve-RealPath $def
+        $dataSrc = if ($dataDir -ne $def) { '共享·链接' } else { '共享' }
+        if (-not (Test-DataDir $dataDir)) {
+            $alt = Find-DataDirCandidate $appName
+            if ($alt) { $dataDir = $alt; $dataSrc = '共享·自动找到' }
+        }
+    }
     return [pscustomobject]@{
         Dir = $dir; Key = $dir.TrimEnd('\').ToLower(); Name = [IO.Path]::GetFileName($dir.TrimEnd('\'))
         Gui = $gui; Cli = $cli; Room = $room; Exe = $main; Version = $version; Branch = $branch; Commit = $commit
         BuildDate = [IO.File]::GetLastWriteTime($main); Portable = $portable; DataDir = $dataDir
-        Profile = $prof; ProfileId = [string]$prof.id; PortableDir = $pdir
+        Profile = $prof; ProfileId = [string]$prof.id; PortableDir = $pdir; AppName = $appName; DataSrc = $dataSrc
     }
 }
 function Scan-Emus {
@@ -1191,7 +1264,8 @@ $MainXaml = @'
             <Button x:Name="BtnEmuAlias" Content="别名 / 备注" Style="{StaticResource Small}" Margin="0,0,6,6"/>
             <Button x:Name="BtnEmuIsolate" Content="隔离数据" Style="{StaticResource Small}" Margin="0,0,6,6"/>
             <Button x:Name="BtnEmuDir" Content="程序目录" Style="{StaticResource Small}" Margin="0,0,6,6"/>
-            <Button x:Name="BtnEmuData" Content="数据目录" Style="{StaticResource Small}" Margin="0,0,6,6"/>
+            <Button x:Name="BtnEmuData" Content="打开数据目录" Style="{StaticResource Small}" Margin="0,0,6,6"/>
+            <Button x:Name="BtnEmuSetData" Content="更改数据目录…" Style="{StaticResource Small}" Margin="0,0,6,6"/>
           </WrapPanel>
           <ListBox x:Name="EmusList">
             <ListBox.ItemTemplate>
@@ -1594,11 +1668,11 @@ function New-GameVM($g) {
     $cover = Load-Image (Find-CoverPath $g) 128
     $parts = @($g.Contents | Group-Object Kind | ForEach-Object { switch ($_.Name) { 'base' { '基础' } 'update' { "更新 ×$($_.Count)" } 'dlc' { "DLC ×$($_.Count)" } } })
     $initial = if ($name) { $name.Substring(0, 1).ToUpper() } else { '?' }
-    return [pscustomobject]@{
-        Name = $name; TitleId = $g.TitleId; Tags = ($parts -join ' · '); Game = $g
-        Cover = $cover; CoverVis = $(if ($cover) { 'Visible' } else { 'Collapsed' })
-        Initial = $initial; TileBg = (Get-TileColor ([string]$g.TitleId))
-    }
+    $vm = New-Object EmuMgr.GameItem
+    $vm.Name = $name; $vm.TitleId = [string]$g.TitleId; $vm.Tags = ($parts -join ' · '); $vm.Game = $g
+    $vm.Cover = $cover; $vm.CoverVis = $(if ($cover) { 'Visible' } else { 'Collapsed' })
+    $vm.Initial = $initial; $vm.TileBg = (Get-TileColor ([string]$g.TitleId))
+    return $vm
 }
 function Fill-Games {
     $keep = $null; $g0 = Get-SelGame; if ($g0) { $keep = $g0.TitleId }
@@ -1631,9 +1705,9 @@ function Fill-Emus {
             Name = (Emu-Display $e); Version = $ver
             Branch = $e.Branch; BranchVis = $(if ($e.Branch) { 'Visible' } else { 'Collapsed' })
             Commit = $commit; CommitVis = $(if ($commit) { 'Visible' } else { 'Collapsed' })
-            DataText = $(if ($e.Portable) { '独立数据' } else { '共享 %APPDATA%' })
-            DataBg = $(if ($e.Portable) { '#16351F' } else { '#3A2C10' })
-            DataFg = $(if ($e.Portable) { '#56D364' } else { '#E3B341' })
+            DataText = $(if ($e.DataSrc -eq '独立') { '独立数据' } else { $e.DataSrc + ' ' + $e.DataDir.Replace($env:APPDATA, '%APPDATA%') })
+            DataBg = $(if ($e.DataSrc -eq '独立' -or $e.DataSrc -eq '自定义') { '#16351F' } else { '#3A2C10' })
+            DataFg = $(if ($e.DataSrc -eq '独立' -or $e.DataSrc -eq '自定义') { '#56D364' } else { '#E3B341' })
             RoomVis = $(if ($e.Room) { 'Visible' } else { 'Collapsed' })
             Build = $e.BuildDate.ToString('yyyy-MM-dd HH:mm')
             StatusText = $st; StatusColor = $col
@@ -1770,9 +1844,9 @@ function Fill-Runs {
     $ui.RunsGrid.ItemsSource = $rows
 }
 function Update-SharedWarning {
-    $shared = @($script:Emus | Where-Object { -not $_.Portable })
     $txt = "已发现 $($script:Emus.Count) 个版本、$($script:Games.Count) 个游戏。"
-    if ($shared.Count -gt 1) { $txt += "  注意：$($shared.Count) 个版本共用 %APPDATA% 数据（存档/着色器/配置互相影响），可选中后点「隔离数据」。" }
+    $groups = @($script:Emus | Group-Object { $_.DataDir.ToLower() } | Where-Object { $_.Count -gt 1 })
+    foreach ($g in $groups) { $txt += "  注意：$($g.Count) 个版本共用 $($g.Group[0].DataDir)（存档/着色器/配置互相影响），可选中后点「隔离数据」。" }
     Set-Status $txt
 }
 function Fill-RoomExes {
@@ -2043,6 +2117,28 @@ function Do-MakePortable($emu) {
         }
     }
     Set-Status '已转为独立数据目录。'
+    Rescan
+}
+function Do-SetDataDir {
+    $emu = Get-SelEmu; if (-not $emu) { return }
+    $em = $script:Db.emus[$emu.Key]
+    $cur = if ($em -and $em.dataDir) { [string]$em.dataDir } else { $emu.DataDir }
+    $v = Show-Form '数据目录' @(@{ L = '数据目录（里面有 nand、keys、config 的文件夹）；留空 = 自动识别'; V = $cur }) ("当前：$($emu.DataDir)（$($emu.DataSrc)）")
+    if ($null -eq $v) { return }
+    $path = ([string]$v[0]).Trim().TrimEnd('\')
+    if ($path -and -not [IO.Directory]::Exists($path)) { Msg "目录不存在：$path" 'Warning'; return }
+    if ($path -and -not (Test-DataDir $path)) { if (-not (Confirm "这个目录里没有 nand 或 keys，确定是模拟器数据目录吗？`n$path")) { return } }
+    if (-not $script:Db.emus.ContainsKey($emu.Key)) { $script:Db.emus[$emu.Key] = @{} }
+    if (-not $emu.Portable -and (Confirm "是否同时应用到所有使用共享数据（$($emu.AppName)）的版本？`n`n是 = 所有共享版本都用这个目录`n否 = 只改【$(Emu-Display $emu)】")) {
+        if (-not ($script:Cfg.SharedDataDirs -is [hashtable])) { $script:Cfg.SharedDataDirs = @{} }
+        if ($path) { $script:Cfg.SharedDataDirs[$emu.AppName] = $path } else { $script:Cfg.SharedDataDirs.Remove($emu.AppName) }
+        $script:Db.emus[$emu.Key].dataDir = ''
+        Write-Json $script:ConfigPath $script:Cfg
+    } else {
+        $script:Db.emus[$emu.Key].dataDir = $path
+    }
+    Save-Db
+    $script:DataDirGuess = @{}
     Rescan
 }
 function Do-ImportZip {
@@ -2461,7 +2557,9 @@ function Add-OfficialTitle([string]$tid, [string]$title) {
 }
 # 后台按 TitleID 向任天堂官网查询封面（独立 runspace，不阻塞界面）
 $script:CoverWorker = @'
-param($tids, $coversDir)
+param($tids, $coversDir, $fallbackUrls)
+$logFile = Join-Path $coversDir 'fetch.log'
+function W([string]$m) { try { [IO.File]::AppendAllText($logFile, (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + '  ' + $m + "`r`n", [Text.Encoding]::UTF8) } catch { } }
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
 foreach ($tid in $tids) {
     try {
@@ -2469,9 +2567,29 @@ foreach ($tid in $tids) {
         $wc.Encoding = [Text.Encoding]::UTF8
         $wc.Headers.Add('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EmuManager')
         $u = 'https://searching.nintendo-europe.com/en/select?q=*&fq=' + [Uri]::EscapeDataString('application_id_s:' + $tid.ToLower()) + '&rows=1&wt=json'
+        W "查询 $tid ：$u"
         $r = $wc.DownloadString($u) | ConvertFrom-Json
         $d = @($r.response.docs) | Select-Object -First 1
-        if (-not $d) { [pscustomobject]@{ Tid = $tid; Found = $false; Ok = $false; Title = ''; Err = '' }; continue }
+        if (-not $d) {
+            W "  任天堂官网未收录 $tid"
+            $ok = $false
+            foreach ($tpl in @($fallbackUrls)) {
+                if (-not $tpl -or $ok) { continue }
+                $fu = ([string]$tpl).Replace('{TID}', $tid).Replace('{tid}', $tid.ToLower())
+                try {
+                    $wc3 = New-Object Net.WebClient
+                    $wc3.Headers.Add('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EmuManager')
+                    $b = $wc3.DownloadData($fu)
+                    if ($b.Length -gt 1024 -and (($b[0] -eq 0xFF -and $b[1] -eq 0xD8) -or ($b[0] -eq 0x89 -and $b[1] -eq 0x50))) {
+                        $ext = if ($b[0] -eq 0x89) { 'png' } else { 'jpg' }
+                        [IO.File]::WriteAllBytes((Join-Path $coversDir "$tid.$ext"), $b); $ok = $true
+                        W "  备用源成功：$fu"
+                    } else { W "  备用源返回的不是图片：$fu" }
+                } catch { W ("  备用源失败：$fu  " + $_.Exception.Message) }
+            }
+            [pscustomobject]@{ Tid = $tid; Found = $ok; Ok = $ok; Title = ''; Err = '' }
+            continue
+        }
         $img = ''
         foreach ($f in @('image_url_sq_s', 'wishlist_email_square_image_url_s', 'image_url')) { if (-not $img -and $d.$f) { $img = [string]$d.$f } }
         if ($img -like '//*') { $img = 'https:' + $img }
@@ -2483,9 +2601,11 @@ foreach ($tid in $tids) {
             $ext = if ($bytes.Length -gt 1 -and $bytes[0] -eq 0x89 -and $bytes[1] -eq 0x50) { 'png' } else { 'jpg' }
             [IO.File]::WriteAllBytes((Join-Path $coversDir "$tid.$ext"), $bytes)
             $ok = $true
+            W "  已下载：$img"
         }
         [pscustomobject]@{ Tid = $tid; Found = $true; Ok = $ok; Title = [string]$d.title; Err = '' }
     } catch {
+        W ("  出错：" + $_.Exception.Message)
         [pscustomobject]@{ Tid = $tid; Found = $false; Ok = $false; Title = ''; Err = $_.Exception.Message }
     }
 }
@@ -2504,7 +2624,7 @@ function Start-AutoCovers([bool]$force = $false) {
     }
     if ($tids.Count -eq 0) { if ($force) { Set-Status '所有游戏都已有封面。' }; return }
     $ps = [powershell]::Create()
-    [void]$ps.AddScript($script:CoverWorker).AddArgument($tids).AddArgument($script:CoversDir)
+    [void]$ps.AddScript($script:CoverWorker).AddArgument($tids).AddArgument($script:CoversDir).AddArgument(@($script:Cfg.CoverUrls))
     $script:CoverJob = @{ PS = $ps; Handle = $ps.BeginInvoke(); Count = $tids.Count }
     $script:CoverTimer.Start()
     Set-Status "正在从任天堂官网获取 $($tids.Count) 个游戏的封面…"
@@ -2515,7 +2635,8 @@ function Cover-Tick {
     if (-not $j.Handle.IsCompleted) { return }
     $script:CoverTimer.Stop()
     $res = @()
-    try { $res = @($j.PS.EndInvoke($j.Handle)) } catch { }
+    try { $res = @($j.PS.EndInvoke($j.Handle)) } catch { Set-Status ('封面获取出错：' + $_.Exception.Message); }
+    foreach ($e in @($j.PS.Streams.Error)) { try { [IO.File]::AppendAllText((Join-Path $script:CoversDir 'fetch.log'), (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + '  后台错误：' + $e.ToString() + "`r`n") } catch { } }
     $j.PS.Dispose(); $script:CoverJob = $null
     $ok = 0; $miss = 0; $err = ''
     foreach ($r in $res) {
@@ -2528,7 +2649,7 @@ function Cover-Tick {
     if ($ok -gt 0) { $script:CoverCache.Clear(); Fill-Games; Update-Header }
     $msg = "封面：获取 $ok 个"
     if ($miss) { $msg += "，官网未收录 $miss 个（可在「封面…」里按名字搜索）" }
-    if ($err) { $msg += "，网络错误：$err" }
+    if ($err) { $msg += "，网络错误：$err（详情见 data\covers\fetch.log）" }
     Set-Status $msg
 }
 function Get-SearchName($game) {
@@ -2732,6 +2853,7 @@ function Show-ExtDialog {
     & $row '封面目录' '自定义封面：<TitleID>.png / .jpg（data\covers）' { Safe { Open-InExplorer $script:CoversDir } }
     & $row '封面在线源' '自动按 TitleID 从任天堂官网取封面（config.json 的 AutoCovers 可关闭）；CoverUrls 为额外的 URL 模板' { Safe { Edit-File $script:ConfigPath } }
     & $row '补全所有封面' '立即为所有还没有封面的游戏重新查询官网（包括之前没找到的）' { Safe { $w.Close(); Start-AutoCovers $true } }
+    & $row '封面下载日志' '查看自动获取封面的过程和错误（data\covers\fetch.log）' { Safe { $f = Join-Path $script:CoversDir 'fetch.log'; if ([IO.File]::Exists($f)) { Edit-File $f } else { Msg '还没有日志。' } } }
     & $row '桌面快捷方式' '在桌面创建带图标的「NX2 Emu Manager」快捷方式（不弹出控制台窗口）' { Safe { New-DesktopShortcut } }
     $btns = New-Object System.Windows.Controls.StackPanel; $btns.Orientation = 'Horizontal'; $btns.HorizontalAlignment = 'Right'; $btns.Margin = (Th 0 8 0 0)
     $reload = New-Object System.Windows.Controls.Button; $reload.Content = '重新加载并扫描'; $reload.Style = $script:App.Resources['Primary']
@@ -2975,6 +3097,7 @@ $ui.BtnEmuAlias.Add_Click({
 $ui.BtnEmuIsolate.Add_Click({ Safe { Do-MakePortable $null } })
 $ui.BtnEmuDir.Add_Click({ Safe { $e = Get-SelEmu; if ($e) { Open-InExplorer $e.Dir } } })
 $ui.BtnEmuData.Add_Click({ Safe { $e = Get-SelEmu; if ($e) { Open-InExplorer $e.DataDir } } })
+$ui.BtnEmuSetData.Add_Click({ Safe { Do-SetDataDir } })
 
 $ui.BtnBrowseTarget.Add_Click({
     Safe {
@@ -3124,4 +3247,4 @@ $win.Add_Closing({
     try { Save-Db } catch { }
 })
 
-[void]$win.ShowDialog()
+try { [void]$win.ShowDialog() } finally { try { $script:Mutex.ReleaseMutex() } catch { } }
