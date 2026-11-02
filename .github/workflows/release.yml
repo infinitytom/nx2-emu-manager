@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: ['EmuManager.ps1']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: ver
+        run: |
+          v=$(grep -oP "AppVersion = '\K[0-9.]+" EmuManager.ps1 | head -1)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if gh release view "v$v" >/dev/null 2>&1; then echo "exists=true" >> "$GITHUB_OUTPUT"; else echo "exists=false" >> "$GITHUB_OUTPUT"; fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Build zip
+        if: steps.ver.outputs.exists == 'false'
+        run: |
+          git archive --format=zip --prefix=NX2-Emu-Manager/ -o "NX2-Emu-Manager-v${{ steps.ver.outputs.version }}.zip" HEAD \
+            EmuManager.ps1 Launch.ps1 EmuManager.bat EmuManager-debug.bat README.md LICENSE assets
+
+      - name: Create release
+        if: steps.ver.outputs.exists == 'false'
+        run: |
+          v="${{ steps.ver.outputs.version }}"
+          notes=$(git log -1 --pretty=%B | grep -v -e '^Co-Authored-By' -e '^Claude-Session')
+          {
+            echo "$notes"
+            echo
+            echo "**安装：** 下载下面的 \`NX2-Emu-Manager-v$v.zip\`，解压到任意位置（推荐与模拟器同一个盘），双击 \`EmuManager.bat\`。"
+            echo "从旧版本升级：直接覆盖文件即可，\`data\\\` 目录里的记录和设置会保留。"
+            echo
+            echo "需要 Windows 10/11（自带 PowerShell 5.1）。不包含任何模拟器、keys、固件或游戏。"
+          } > notes.md
+          gh release create "v$v" "NX2-Emu-Manager-v$v.zip" --title "NX2 Emu Manager v$v" --notes-file notes.md --target "$GITHUB_SHA"
+        env:
+          GH_TOKEN: ${{ github.token }}
