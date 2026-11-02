@@ -1,4 +1,4 @@
-# EmuManager · Eden / Eglantine 多版本管理器
+# NX2 Emu Manager · Eden / Eglantine 多版本管理器
 
 Eden 系模拟器（Eden、Eglantine / PokeDinner 分支，以及 yuzu / citron / sudachi / suyu 等同源分支）的 **多版本管理、调试和联机工具**。
 分支多、更新快，不同游戏要配不同版本？用它挑版本、启动、对比开关、管理存档和着色器，再开个联机房间。

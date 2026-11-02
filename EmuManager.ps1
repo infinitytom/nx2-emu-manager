@@ -1,5 +1,5 @@
 ﻿# EmuManager - Eden / Eglantine 多版本管理器
-# https://github.com/infinitytom/eden-version-manager
+# https://github.com/infinitytom/nx2-emu-manager
 # 双击 EmuManager.bat 启动。仅依赖 Windows 自带的 PowerShell 5.1 + .NET Framework (WPF)。
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
