@@ -10,7 +10,7 @@ Add-Type -AssemblyName System.Xaml
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-$script:AppVersion = '2.0.0'
+$script:AppVersion = '2.1.0'
 
 # ================================================================ 路径与持久化
 $script:AppRoot    = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -60,6 +60,7 @@ Ensure-Key $Cfg 'GameRoots'     @($Drive)
 Ensure-Key $Cfg 'VersionsDir'   (Join-Path $Drive 'EmuVersions')
 Ensure-Key $Cfg 'EmuScanDepth'  3
 Ensure-Key $Cfg 'GameScanDepth' 5
+Ensure-Key $Cfg 'CoverUrls'     @('https://tinfoil.media/ti/{TID}/256/256/')
 Write-Json $ConfigPath $Cfg
 
 $script:Db = Read-Json $DbPath
@@ -68,6 +69,7 @@ Ensure-Key $Db 'games' @{}
 Ensure-Key $Db 'compat' @{}
 Ensure-Key $Db 'profiles' @{}
 Ensure-Key $Db 'room' @{}
+Ensure-Key $Db 'presets' @{}
 Ensure-Key $Db 'runs' (New-Object System.Collections.ArrayList)
 if (-not ($Db.runs -is [System.Collections.ArrayList])) {
     $tmp = New-Object System.Collections.ArrayList; foreach ($x in $Db.runs) { [void]$tmp.Add($x) }; $Db.runs = $tmp
@@ -79,7 +81,7 @@ $script:StatusHex = @{
     '未测试' = '#3A4150'; '完美' = '#238636'; '可玩' = '#2EA043'; '卡顿/掉帧' = '#9E6A03'
     '画面错误' = '#B08800'; '偶发崩溃' = '#C9510C'; '必崩/卡死' = '#DA3633'; '无法启动' = '#8B1A1A'
 }
-$script:KnownTitles = @{ '040074A01BF12000' = '咚奇刚 蕉力全开' }
+$script:Titles = @{}
 $script:ExitNames = @{
     'C0000005' = '访问冲突'; 'C0000409' = '栈缓冲溢出/abort'; 'C00000FD' = '栈溢出'
     'E06D7363' = 'C++ 异常'; '80000003' = '断点'; 'C0000374' = '堆损坏'; 'C000001D' = '非法指令'
@@ -88,7 +90,7 @@ $script:ExitNames = @{
 
 # ================================================================ 通用工具
 function Get-SubDirs([string]$path) {
-    try { return ,[IO.Directory]::GetDirectories($path) } catch { return ,@() }
+    try { return [IO.Directory]::GetDirectories($path) } catch { return }
 }
 function Safe-Name([string]$s) {
     if (-not $s) { return '_' }
@@ -161,31 +163,230 @@ function To-Brush([string]$hex) {
     return $script:BrushCache[$hex]
 }
 
+# ================================================================ 扩展配置（模拟器档案 / 游戏名 / 工具 / 钩子 / 封面）
+$script:ProfilesPath = Join-Path $DataRoot 'profiles.json'
+$script:TitlesPath   = Join-Path $DataRoot 'titles.json'
+$script:ToolsPath    = Join-Path $DataRoot 'tools.json'
+$script:HooksDir     = Join-Path $DataRoot 'hooks'
+$script:CoversDir    = Join-Path $DataRoot 'covers'
+foreach ($d in @($HooksDir, (Join-Path $HooksDir 'pre-launch'), (Join-Path $HooksDir 'post-exit'), $CoversDir)) {
+    if (-not [IO.Directory]::Exists($d)) { [void][IO.Directory]::CreateDirectory($d) }
+}
+
+function Get-DefaultProfiles {
+    return @(
+        [ordered]@{
+            id = 'eden'; enabled = $true
+            name = 'Eden 家族（Eden / Eglantine / yuzu / citron / sudachi / suyu）'
+            gui  = @('eglantine.exe', 'eden.exe', 'citron.exe', 'sudachi.exe', 'suyu.exe', 'torzu.exe', 'yuzu.exe')
+            cli  = @('eden-cli.exe', 'eglantine-cli.exe', 'eden-cmd.exe', 'yuzu-cmd.exe', 'citron-cmd.exe', 'suyu-cmd.exe', 'sudachi-cmd.exe')
+            room = @('eden-room.exe', 'eglantine-room.exe', 'yuzu-room.exe', 'citron-room.exe', 'suyu-room.exe', 'sudachi-room.exe')
+            portableDir = 'user'
+            appData = [ordered]@{ yuzu = 'yuzu'; torzu = 'yuzu'; citron = 'citron'; sudachi = 'sudachi'; suyu = 'suyu'; '*' = 'eden' }
+            launchArgs = '{fullscreen} -g "{target}"'
+            fullscreenArg = '-f'
+            switchRegex = '(?:EDEN|YUZU|CITRON)_NX2_[A-Z0-9_]{2,}|EDEN_[A-Z][A-Z0-9_]{3,}'
+            switchFiles = @('{emuDir}\nx2_switches.txt', '{appdata}\eden\nx2_switches.txt')
+            saveRoot = '{data}\nand\user\save\0000000000000000'
+            logDir = '{data}\log'
+            iconCache = '{data}\cache\game_list\{tid}.jpeg'
+            locations = @(
+                [ordered]@{ type = '着色器缓存'; kind = 'shader'; path = '{data}\shader\{tidl}' },
+                [ordered]@{ type = 'Mods (load)'; kind = 'mods'; path = '{data}\load\{tid}' },
+                [ordered]@{ type = 'SDMC 内容'; kind = 'sdmc'; path = '{data}\sdmc\atmosphere\contents\{tid}' },
+                [ordered]@{ type = '游戏专属配置'; kind = 'gconfig'; path = '{data}\config\custom\{tid}.ini' },
+                [ordered]@{ type = '全局配置 qt-config.ini'; kind = 'config'; path = '{data}\config\qt-config.ini' },
+                [ordered]@{ type = '日志目录'; kind = 'log'; path = '{data}\log' },
+                [ordered]@{ type = 'Keys'; kind = 'keys'; path = '{data}\keys' },
+                [ordered]@{ type = '固件 (registered)'; kind = 'fw'; path = '{data}\nand\system\Contents\registered'; big = $true }
+            )
+            multiplayer = [ordered]@{ file = '{data}\config\qt-config.ini'; section = 'Multiplayer'; nick = 'nickname'; ip = 'ip'; port = 'port' }
+            portableCopyAll = @('keys', 'nand', 'config', 'load', 'sdmc')
+            portableCopyMin = @('keys', 'nand\system')
+        },
+        [ordered]@{
+            id = 'ryujinx'; enabled = $true
+            name = 'Ryujinx 家族（Ryujinx / Ryubing 等）'
+            gui  = @('Ryujinx.exe', 'Ryujinx.Ava.exe')
+            cli  = @()
+            room = @()
+            portableDir = 'portable'
+            appData = [ordered]@{ '*' = 'Ryujinx' }
+            launchArgs = '{fullscreen} "{target}"'
+            fullscreenArg = '--fullscreen'
+            switchRegex = 'RYUJINX_[A-Z0-9_]{3,}'
+            switchFiles = @()
+            saveRoot = ''
+            logDir = '{data}\Logs'
+            iconCache = ''
+            locations = @(
+                [ordered]@{ type = '着色器缓存'; kind = 'shader'; path = '{data}\games\{tidl}\cache\shader' },
+                [ordered]@{ type = '游戏数据目录'; kind = 'other'; path = '{data}\games\{tidl}' },
+                [ordered]@{ type = 'Mods'; kind = 'mods'; path = '{data}\mods\contents\{tidl}' },
+                [ordered]@{ type = '存档根目录（按存档 ID 存放）'; kind = 'other'; path = '{data}\bis\user\save'; big = $true },
+                [ordered]@{ type = '全局配置 Config.json'; kind = 'config'; path = '{data}\Config.json' },
+                [ordered]@{ type = '日志目录'; kind = 'log'; path = '{data}\Logs' },
+                [ordered]@{ type = 'Keys'; kind = 'keys'; path = '{data}\system' }
+            )
+            multiplayer = $null
+            portableCopyAll = @('system', 'bis', 'Config.json')
+            portableCopyMin = @('system')
+        }
+    )
+}
+function Read-JsonArray($path) {
+    if (-not [IO.File]::Exists($path)) { return $null }
+    try {
+        $o = [IO.File]::ReadAllText($path, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        $list = New-Object System.Collections.ArrayList
+        foreach ($x in @($o)) { if ($null -ne $x) { [void]$list.Add((ConvertTo-HT $x)) } }
+        return ,$list
+    } catch {
+        Msg ("读取失败（JSON 格式错误？）：$path`n" + $_.Exception.Message) 'Warning'
+        return $null
+    }
+}
+function Write-DefaultFile([string]$path, [string]$text) {
+    if (-not [IO.File]::Exists($path)) { [IO.File]::WriteAllText($path, $text, (New-Object Text.UTF8Encoding($false))) }
+}
+function Load-Extensions {
+    # 模拟器档案：缺少的内置档案会自动补上；想禁用某个档案请把 enabled 设为 false
+    $defs = Get-DefaultProfiles
+    $p = Read-JsonArray $script:ProfilesPath
+    if ($null -eq $p) {
+        Write-Json $script:ProfilesPath $defs
+        $p = Read-JsonArray $script:ProfilesPath
+    } else {
+        $ids = @($p | ForEach-Object { [string]$_.id }); $added = $false
+        foreach ($d in $defs) {
+            if ($ids -notcontains $d.id) { [void]$p.Add((ConvertTo-HT (ConvertTo-Json -InputObject $d -Depth 8 | ConvertFrom-Json))); $added = $true }
+        }
+        if ($added) { Write-Json $script:ProfilesPath $p }
+    }
+    if ($null -eq $p) { $p = New-Object System.Collections.ArrayList }
+    $script:Profiles = $p
+    $script:ActiveProfiles = @($p | Where-Object { $_ -and $_.enabled -ne $false })
+
+    Write-DefaultFile $script:TitlesPath "{`r`n  `"040074A01BF12000`": `"咚奇刚 蕉力全开`"`r`n}`r`n"
+    $t = Read-Json $script:TitlesPath
+    $script:Titles = @{}
+    foreach ($k in $t.Keys) { $script:Titles[$k.ToUpper()] = [string]$t[$k] }
+
+    $toolsDefault = @'
+[
+  {
+    "name": "命令行（带环境变量）",
+    "tip": "在版本目录打开命令行，已注入环境变量框里的开关，可以手动运行 exe 观察输出",
+    "command": "cmd.exe",
+    "args": "/k cd /d \"{emuDir}\"",
+    "env": true
+  },
+  {
+    "name": "打开最新日志",
+    "command": "notepad.exe",
+    "args": "\"{data}\\log\\eden_log.txt\""
+  },
+  {
+    "name": "RenderDoc（示例：改好路径后把 enabled 改为 true）",
+    "enabled": false,
+    "command": "C:\\Program Files\\RenderDoc\\qrenderdoc.exe",
+    "args": "",
+    "env": true
+  }
+]
+'@
+    Write-DefaultFile $script:ToolsPath $toolsDefault
+    $script:Tools = Read-JsonArray $script:ToolsPath
+    if ($null -eq $script:Tools) { $script:Tools = @() }
+
+    $hookReadme = @'
+钩子脚本（PowerShell）
+======================
+把 .ps1 文件放进对应文件夹即可，按文件名顺序执行：
+  pre-launch\   每次启动模拟器之前
+  post-exit\    模拟器退出、日志收集完之后
+
+脚本会收到一个参数 $Ctx：
+  $Ctx.Stage      'pre-launch' 或 'post-exit'
+  $Ctx.Emu        版本信息：.Name .Dir .DataDir .Exe .Cli .Branch .Commit .ProfileId
+  $Ctx.Game       游戏信息：.TitleId .FolderName .Dir
+  $Ctx.EmuName / $Ctx.GameName   显示名称
+  $Ctx.Target     启动目标路径
+  $Ctx.Env        环境变量（有序字典）。pre-launch 中修改会作用于本次启动
+  $Ctx.Args       启动参数字符串。pre-launch 中可修改
+  $Ctx.Cli        是否命令行前端
+  post-exit 额外有：$Ctx.ExitCode（数字） $Ctx.ExitText $Ctx.Seconds $Ctx.Log（本次日志副本）
+
+pre-launch 脚本返回 $false 可以取消这次启动。
+
+示例（post-exit\10-crash-pack.ps1）：崩溃时把日志和开关打包到桌面
+  param($Ctx)
+  if ($Ctx.ExitCode -ne 0 -and $Ctx.Log) {
+      $dst = Join-Path ([Environment]::GetFolderPath('Desktop')) ("crash_" + (Get-Date -f yyyyMMdd-HHmmss))
+      New-Item -ItemType Directory $dst | Out-Null
+      Copy-Item $Ctx.Log $dst
+      ($Ctx.Env.GetEnumerator() | % { "$($_.Key)=$($_.Value)" }) | Set-Content (Join-Path $dst 'env.txt')
+  }
+'@
+    Write-DefaultFile (Join-Path $script:HooksDir 'README.txt') $hookReadme
+}
+
+function Expand-T([string]$tpl, $emu, $game, [string]$target = '') {
+    if (-not $tpl) { return '' }
+    $tid = ''; if ($game -and $game.TitleId -notlike 'FILE:*') { $tid = [string]$game.TitleId }
+    $map = [ordered]@{
+        '{data}' = $(if ($emu) { [string]$emu.DataDir } else { '' })
+        '{emuDir}' = $(if ($emu) { [string]$emu.Dir } else { '' })
+        '{exe}' = $(if ($emu) { [string]$emu.Exe } else { '' })
+        '{gui}' = $(if ($emu) { [string]$emu.Gui } else { '' })
+        '{cli}' = $(if ($emu) { [string]$emu.Cli } else { '' })
+        '{emuName}' = $(if ($emu) { Emu-Display $emu } else { '' })
+        '{tidl}' = $tid.ToLower()
+        '{tid}' = $tid
+        '{TID}' = $tid
+        '{gameDir}' = $(if ($game) { [string]$game.Dir } else { '' })
+        '{gameName}' = $(if ($game) { Game-Display $game } else { '' })
+        '{target}' = $target
+        '{appdata}' = $env:APPDATA
+        '{localappdata}' = $env:LOCALAPPDATA
+        '{manager}' = $script:AppRoot
+        '{managerData}' = $script:DataRoot
+    }
+    $s = $tpl
+    foreach ($k in $map.Keys) { $s = $s.Replace($k, [string]$map[$k]) }
+    return $s
+}
+
 # ================================================================ 模拟器扫描
-$script:EmuExeNames  = @('eglantine.exe', 'eden.exe', 'citron.exe', 'sudachi.exe', 'suyu.exe', 'torzu.exe', 'yuzu.exe')
-$script:CliExeNames  = @('eden-cli.exe', 'eglantine-cli.exe', 'eden-cmd.exe', 'yuzu-cmd.exe', 'citron-cmd.exe', 'suyu-cmd.exe', 'sudachi-cmd.exe')
-$script:RoomExeNames = @('eden-room.exe', 'eglantine-room.exe', 'yuzu-room.exe', 'citron-room.exe', 'suyu-room.exe', 'sudachi-room.exe')
 $script:SkipDirs = @('$RECYCLE.BIN', 'System Volume Information', 'romfs', 'exefs', '.git', 'node_modules', 'Windows', 'Program Files', 'Program Files (x86)', 'ProgramData')
 
-function Test-EmuDir([string]$p) {
-    foreach ($n in ($script:EmuExeNames + $script:CliExeNames)) { if ([IO.File]::Exists((Join-Path $p $n))) { return $true } }
-    return $false
+function Find-ProfileExe($prof, [string]$dir, [string]$list) {
+    foreach ($n in @($prof[$list])) { if ($n) { $f = Join-Path $dir $n; if ([IO.File]::Exists($f)) { return $f } } }
+    return $null
 }
-function Get-AppDataName([string]$exeName) {
-    $e = $exeName.ToLower()
-    if ($e.StartsWith('yuzu') -or $e.StartsWith('torzu')) { return 'yuzu' }
-    foreach ($n in @('citron', 'sudachi', 'suyu')) { if ($e.StartsWith($n)) { return $n } }
-    return 'eden'
+function Get-DirProfile([string]$p) {
+    foreach ($pr in $script:ActiveProfiles) { if ((Find-ProfileExe $pr $p 'gui') -or (Find-ProfileExe $pr $p 'cli')) { return $pr } }
+    return $null
+}
+function Test-EmuDir([string]$p) { return [bool](Get-DirProfile $p) }
+function Get-ProfileAppData($prof, [string]$exeName) {
+    $m = $prof.appData; $e = $exeName.ToLower()
+    if ($m -is [System.Collections.IDictionary]) {
+        foreach ($k in @($m.Keys)) { if ($k -ne '*' -and $e.StartsWith(([string]$k).ToLower())) { return [string]$m[$k] } }
+        if ($m.Contains('*')) { return [string]$m['*'] }
+    } elseif ($m) { return [string]$m }
+    return [IO.Path]::GetFileNameWithoutExtension($exeName)
 }
 function Get-EmuInfo([string]$dir) {
-    $gui = $null; $cli = $null; $room = $null
-    foreach ($n in $script:EmuExeNames)  { $f = Join-Path $dir $n; if ([IO.File]::Exists($f)) { $gui = $f; break } }
-    foreach ($n in $script:CliExeNames)  { $f = Join-Path $dir $n; if ([IO.File]::Exists($f)) { $cli = $f; break } }
-    foreach ($n in $script:RoomExeNames) { $f = Join-Path $dir $n; if ([IO.File]::Exists($f)) { $room = $f; break } }
+    $prof = Get-DirProfile $dir
+    if (-not $prof) { throw "不是模拟器目录：$dir" }
+    $gui = Find-ProfileExe $prof $dir 'gui'
+    $cli = Find-ProfileExe $prof $dir 'cli'
+    $room = Find-ProfileExe $prof $dir 'room'
     $main = if ($gui) { $gui } else { $cli }
     $version = ''; $branch = ''; $commit = ''
     $info = ''
-    foreach ($vf in @('VERSION.txt', 'BUILD-INFO.txt')) {
+    foreach ($vf in @('VERSION.txt', 'BUILD-INFO.txt', 'version.txt')) {
         $f = Join-Path $dir $vf
         if ([IO.File]::Exists($f)) { $info += [IO.File]::ReadAllText($f) + "`n" }
     }
@@ -205,12 +406,14 @@ function Get-EmuInfo([string]$dir) {
     if (-not $version) {
         try { $fvi = [Diagnostics.FileVersionInfo]::GetVersionInfo($main); if ($fvi.ProductVersion) { $version = $fvi.ProductVersion } } catch { }
     }
-    $portable = [IO.Directory]::Exists((Join-Path $dir 'user'))
-    $dataDir = if ($portable) { Join-Path $dir 'user' } else { Join-Path $env:APPDATA (Get-AppDataName ([IO.Path]::GetFileName($main))) }
+    $pdir = [string]$prof.portableDir; if (-not $pdir) { $pdir = 'user' }
+    $portable = [IO.Directory]::Exists((Join-Path $dir $pdir))
+    $dataDir = if ($portable) { Join-Path $dir $pdir } else { Join-Path $env:APPDATA (Get-ProfileAppData $prof ([IO.Path]::GetFileName($main))) }
     return [pscustomobject]@{
         Dir = $dir; Key = $dir.TrimEnd('\').ToLower(); Name = [IO.Path]::GetFileName($dir.TrimEnd('\'))
         Gui = $gui; Cli = $cli; Room = $room; Exe = $main; Version = $version; Branch = $branch; Commit = $commit
         BuildDate = [IO.File]::GetLastWriteTime($main); Portable = $portable; DataDir = $dataDir
+        Profile = $prof; ProfileId = [string]$prof.id; PortableDir = $pdir
     }
 }
 function Scan-Emus {
@@ -333,7 +536,7 @@ function Emu-Display($emu) {
 function Game-Display($game) {
     $g = $script:Db.games[$game.TitleId]
     if ($g -and $g.alias) { return $g.alias }
-    if ($script:KnownTitles.ContainsKey($game.TitleId)) { return $script:KnownTitles[$game.TitleId] }
+    if ($script:Titles.ContainsKey($game.TitleId)) { return $script:Titles[$game.TitleId] }
     return $game.FolderName
 }
 function Compat-Key($emu, $game) { return ($emu.Key + '|' + $game.TitleId) }
@@ -345,7 +548,7 @@ function Get-Compat($emu, $game) {
 
 # ================================================================ 数据位置
 function Get-GameLocations($emu, $game) {
-    $d = $emu.DataDir; $tid = $game.TitleId
+    $prof = $emu.Profile; $d = $emu.DataDir; $tid = $game.TitleId
     $L = New-Object System.Collections.ArrayList
     $add = {
         param($type, $kind, $path, $nosize)
@@ -353,8 +556,8 @@ function Get-GameLocations($emu, $game) {
         [void]$L.Add([pscustomobject]@{ Type = $type; Kind = $kind; Path = $path; Exists = $ex; IsFile = [IO.File]::Exists($path); NoSize = [bool]$nosize; SizeText = ''; StateText = $(if ($ex) { '存在' } else { '—' }) })
     }
     $hasTid = ($tid -notlike 'FILE:*')
-    if ($hasTid) {
-        $saveRoot = Join-Path $d 'nand\user\save\0000000000000000'
+    if ($hasTid -and $prof.saveRoot) {
+        $saveRoot = Expand-T ([string]$prof.saveRoot) $emu $game
         $users = @(Get-SubDirs $saveRoot)
         $got = $false
         foreach ($u in $users) {
@@ -369,17 +572,17 @@ function Get-GameLocations($emu, $game) {
             $ph = if ($users.Count -gt 0) { Join-Path $users[0] $tid } else { Join-Path $saveRoot "_未知用户_\$tid" }
             & $add '存档（尚未生成）' 'save' $ph $false
         }
-        & $add '着色器缓存' 'shader' (Join-Path $d ('shader\' + $tid.ToLower())) $false
-        & $add 'Mods (load)' 'mods' (Join-Path $d "load\$tid") $false
-        & $add 'SDMC 内容' 'sdmc' (Join-Path $d "sdmc\atmosphere\contents\$tid") $false
-        & $add '游戏专属配置' 'gconfig' (Join-Path $d "config\custom\$tid.ini") $false
     }
-    & $add '全局配置 qt-config.ini' 'config' (Join-Path $d 'config\qt-config.ini') $false
-    & $add '日志目录' 'log' (Join-Path $d 'log') $false
-    & $add 'Keys' 'keys' (Join-Path $d 'keys') $false
-    & $add '固件 (registered)' 'fw' (Join-Path $d 'nand\system\Contents\registered') $true
-    & $add 'NX2 开关（用户，优先）' 'switch' (Join-Path $env:APPDATA 'eden\nx2_switches.txt') $false
-    & $add 'NX2 开关（版本自带）' 'switch' (Join-Path $emu.Dir 'nx2_switches.txt') $false
+    foreach ($loc in @($prof.locations)) {
+        if (-not $loc -or -not $loc.path) { continue }
+        if (-not $hasTid -and ([string]$loc.path -match '\{(tid|tidl|TID)\}')) { continue }
+        & $add ([string]$loc.type) ([string]$loc.kind) (Expand-T ([string]$loc.path) $emu $game) ([bool]$loc.big)
+    }
+    foreach ($sf in @($prof.switchFiles)) {
+        if (-not $sf) { continue }
+        $label = if ([string]$sf -like '*{appdata}*') { '开关文件（用户，优先）' } else { '开关文件（版本自带）' }
+        & $add $label 'switch' (Expand-T ([string]$sf) $emu $game) $false
+    }
     & $add '数据根目录' 'root' $d $true
     & $add '模拟器目录' 'emu' $emu.Dir $true
     if ($game.Dir) { & $add '游戏目录' 'game' $game.Dir $true }
@@ -397,6 +600,7 @@ function Get-GameLocations($emu, $game) {
     }
     return ,$L
 }
+
 function Backup-Path([string]$path, $game, $emu, [string]$kind) {
     $dir = Join-Path (Join-Path $script:BackupRoot (Safe-Name (Game-Display $game))) (Safe-Name $kind)
     if (-not [IO.Directory]::Exists($dir)) { [void][IO.Directory]::CreateDirectory($dir) }
@@ -412,37 +616,119 @@ function Backup-Path([string]$path, $game, $emu, [string]$kind) {
 
 # ================================================================ 开关扫描
 $script:SwitchCache = @{}
-function Get-ExeSwitches([string]$exe) {
-    if (-not $exe -or -not [IO.File]::Exists($exe)) { return ,@() }
+function Get-ExeSwitches([string]$exe, [string]$regex) {
+    if (-not $exe -or -not $regex -or -not [IO.File]::Exists($exe)) { return }
     $fi = New-Object IO.FileInfo $exe
-    $k = $exe.ToLower() + '|' + $fi.Length + '|' + $fi.LastWriteTimeUtc.Ticks
+    $k = $exe.ToLower() + '|' + $fi.Length + '|' + $fi.LastWriteTimeUtc.Ticks + '|' + $regex
     if (-not $script:SwitchCache.ContainsKey($k)) {
         $s = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe))
         $set = New-Object 'System.Collections.Generic.SortedSet[string]'
-        foreach ($m in [regex]::Matches($s, '(?:EDEN|YUZU|CITRON)_NX2_[A-Z0-9_]{2,}|EDEN_[A-Z][A-Z0-9_]{3,}')) { [void]$set.Add($m.Value) }
+        foreach ($m in [regex]::Matches($s, $regex)) { [void]$set.Add($m.Value) }
         $script:SwitchCache[$k] = @($set)
     }
-    return ,$script:SwitchCache[$k]
+    return $script:SwitchCache[$k]
 }
 function Get-EmuSwitches($emu) {
-    $a = @(Get-ExeSwitches $emu.Exe)
-    if ($emu.Cli -and $emu.Cli -ne $emu.Exe) { $a = @(@($a) + @(Get-ExeSwitches $emu.Cli) | Sort-Object -Unique) }
+    $rx = [string]$emu.Profile.switchRegex
+    $a = @(Get-ExeSwitches $emu.Exe $rx)
+    if ($emu.Cli -and $emu.Cli -ne $emu.Exe) { $a = @(@($a) + @(Get-ExeSwitches $emu.Cli $rx) | Sort-Object -Unique) }
     return ,$a
 }
 function Get-SwitchDefaults($emu) {
     $h = @{}
-    foreach ($f in @((Join-Path $emu.Dir 'nx2_switches.txt'), (Join-Path $env:APPDATA 'eden\nx2_switches.txt'))) {
+    foreach ($tpl in @($emu.Profile.switchFiles)) {
+        if (-not $tpl) { continue }
+        $f = Expand-T ([string]$tpl) $emu $null
         if (-not [IO.File]::Exists($f)) { continue }
+        $src = if ([string]$tpl -like '*{appdata}*') { '用户文件' } else { '自带文件' }
         foreach ($line in [IO.File]::ReadAllLines($f)) {
             $m = [regex]::Match($line, '^\s*(#?)\s*([A-Z][A-Z0-9_]+)\s*=\s*(.*)$')
             if ($m.Success) {
-                $src = if ($f -like "$env:APPDATA*") { '用户文件' } else { '自带文件' }
                 $state = if ($m.Groups[1].Value) { '注释' } else { '生效' }
                 $h[$m.Groups[2].Value] = @{ value = $m.Groups[3].Value.Trim(); where = "$src($state)" }
             }
         }
     }
     return $h
+}
+
+# ================================================================ 封面
+$script:CoverCache = @{}
+$script:TilePalette = @('#3B5BDB', '#7048E8', '#C2255C', '#E8590C', '#2B8A3E', '#1098AD', '#5F3DC4', '#D6336C')
+function Get-TileColor([string]$s) {
+    $sum = 0; foreach ($ch in $s.ToCharArray()) { $sum += [int]$ch }
+    return $script:TilePalette[$sum % $script:TilePalette.Count]
+}
+function Get-GameRootDir($game) {
+    if (-not $game.Dir) { return $null }
+    if ([IO.Path]::GetFileName($game.Dir) -ieq 'base') { return [IO.Path]::GetDirectoryName($game.Dir) }
+    return $game.Dir
+}
+function Find-CoverPath($game) {
+    $tid = [string]$game.TitleId
+    $hasTid = ($tid -notlike 'FILE:*')
+    if ($hasTid) {
+        foreach ($ext in @('png', 'jpg', 'jpeg', 'bmp')) { $f = Join-Path $script:CoversDir "$tid.$ext"; if ([IO.File]::Exists($f)) { return $f } }
+    }
+    $dirs = @(); $root = Get-GameRootDir $game
+    if ($root) { $dirs += $root }
+    if ($game.Dir -and $game.Dir -ne $root) { $dirs += $game.Dir }
+    foreach ($d in $dirs) {
+        $imgs = @(Get-ChildItem -LiteralPath $d -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -match '^\.(png|jpe?g|bmp)$' })
+        $pref = @($imgs | Where-Object { $_.BaseName -match '^(cover|icon|boxart|banner|poster|folder|title)' })
+        if ($pref.Count -gt 0) { return $pref[0].FullName }
+        if ($imgs.Count -eq 1) { return $imgs[0].FullName }
+    }
+    if ($hasTid) {
+        foreach ($e in $script:Emus) {
+            $ic = [string]$e.Profile.iconCache
+            if ($ic) { $f = Expand-T $ic $e $game; if ([IO.File]::Exists($f)) { return $f } }
+        }
+    }
+    return $null
+}
+function Load-Image([string]$path, [int]$px = 160) {
+    if (-not $path -or -not [IO.File]::Exists($path)) { return $null }
+    $k = $path.ToLower() + '|' + [IO.File]::GetLastWriteTimeUtc($path).Ticks + '|' + $px
+    if ($script:CoverCache.ContainsKey($k)) { return $script:CoverCache[$k] }
+    try {
+        $bi = New-Object System.Windows.Media.Imaging.BitmapImage
+        $bi.BeginInit()
+        $bi.UriSource = New-Object Uri($path)
+        $bi.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+        $bi.CreateOptions = [System.Windows.Media.Imaging.BitmapCreateOptions]::IgnoreImageCache
+        $bi.DecodePixelWidth = $px
+        $bi.EndInit(); $bi.Freeze()
+        $script:CoverCache[$k] = $bi
+        return $bi
+    } catch { return $null }
+}
+function Remove-CustomCover([string]$tid) {
+    foreach ($ext in @('png', 'jpg', 'jpeg', 'bmp')) { $f = Join-Path $script:CoversDir "$tid.$ext"; if ([IO.File]::Exists($f)) { Remove-Item -LiteralPath $f -Force } }
+}
+
+# ================================================================ 钩子 / 工具
+function Invoke-Hooks([string]$stage, $ctx) {
+    $dir = Join-Path $script:HooksDir $stage
+    if (-not [IO.Directory]::Exists($dir)) { return $true }
+    foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter *.ps1 -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
+        try {
+            $res = & $f.FullName $ctx
+            if (@($res) -contains $false) { Set-Status "钩子 $($f.Name) 取消了本次操作"; return $false }
+        } catch { Set-Status ("钩子 $($f.Name) 出错：" + $_.Exception.Message) }
+    }
+    return $true
+}
+function Start-WithEnv($psi, $pairs) {
+    $saved = @{}
+    if ($pairs) {
+        foreach ($k in @($pairs.Keys)) {
+            $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process')
+            [Environment]::SetEnvironmentVariable($k, [string]$pairs[$k], 'Process')
+        }
+    }
+    try { return [Diagnostics.Process]::Start($psi) }
+    finally { foreach ($k in @($saved.Keys)) { [Environment]::SetEnvironmentVariable($k, $saved[$k], 'Process') } }
 }
 
 # ================================================================ 联机工具
@@ -459,7 +745,7 @@ function Get-LanIPs {
             }
         }
     } catch { }
-    return ,$r
+    return $r
 }
 function Set-IniValue([string]$file, [string]$section, [string]$key, [string]$value) {
     $lines = New-Object System.Collections.Generic.List[string]
@@ -780,6 +1066,7 @@ $MainXaml = @'
       <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
         <Button x:Name="BtnImport" Content="＋ 导入 zip 版本" Style="{StaticResource Primary}" Margin="0,0,8,0"/>
         <Button x:Name="BtnRescan" Content="⟳ 重新扫描" Margin="0,0,8,0"/>
+        <Button x:Name="BtnExt" Content="扩展" Margin="0,0,8,0"/>
         <Button x:Name="BtnSettings" Content="扫描目录" Margin="0,0,8,0"/>
         <Button x:Name="BtnDataDir" Content="管理器数据" Margin="0"/>
       </StackPanel>
@@ -818,16 +1105,29 @@ $MainXaml = @'
           </DockPanel>
           <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Margin="0,8,0,0">
             <Button x:Name="BtnGameRename" Content="重命名" Style="{StaticResource Small}"/>
+            <Button x:Name="BtnGameCover" Content="封面…" Style="{StaticResource Small}"/>
             <Button x:Name="BtnGameDir" Content="打开目录" Style="{StaticResource Small}"/>
           </StackPanel>
           <ListBox x:Name="GamesList">
             <ListBox.ItemTemplate>
               <DataTemplate>
-                <StackPanel>
-                  <TextBlock Text="{Binding Name}" FontSize="14" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
-                  <TextBlock Text="{Binding TitleId}" FontFamily="Consolas" FontSize="11" Foreground="#8C95A6" Margin="0,2,0,0"/>
-                  <TextBlock Text="{Binding Tags}" FontSize="11" Foreground="#7FA6FF" Margin="0,3,0,0"/>
-                </StackPanel>
+                <DockPanel>
+                  <Grid DockPanel.Dock="Left" Width="54" Height="54" Margin="0,0,11,0">
+                    <Border CornerRadius="9" Background="{Binding TileBg}">
+                      <TextBlock Text="{Binding Initial}" FontSize="22" FontWeight="Bold" Foreground="White" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Border>
+                    <Border CornerRadius="9" Visibility="{Binding CoverVis}">
+                      <Border.Background>
+                        <ImageBrush ImageSource="{Binding Cover}" Stretch="UniformToFill"/>
+                      </Border.Background>
+                    </Border>
+                  </Grid>
+                  <StackPanel VerticalAlignment="Center">
+                    <TextBlock Text="{Binding Name}" FontSize="14" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                    <TextBlock Text="{Binding TitleId}" FontFamily="Consolas" FontSize="11" Foreground="#8C95A6" Margin="0,2,0,0"/>
+                    <TextBlock Text="{Binding Tags}" FontSize="11" Foreground="#7FA6FF" Margin="0,3,0,0"/>
+                  </StackPanel>
+                </DockPanel>
               </DataTemplate>
             </ListBox.ItemTemplate>
           </ListBox>
@@ -897,10 +1197,18 @@ $MainXaml = @'
       <!-- 详情 -->
       <Border Grid.Column="4" Style="{StaticResource Card}">
         <DockPanel>
-          <StackPanel DockPanel.Dock="Top" Margin="2,0,0,0">
-            <TextBlock x:Name="SelTitle" Text="请选择游戏和版本" FontSize="17" FontWeight="Bold" TextTrimming="CharacterEllipsis"/>
-            <TextBlock x:Name="SelSub" Foreground="#8C95A6" FontSize="11" TextTrimming="CharacterEllipsis" Margin="0,2,0,0"/>
-          </StackPanel>
+          <DockPanel DockPanel.Dock="Top" Margin="2,0,0,0">
+            <Grid DockPanel.Dock="Left" Width="56" Height="56" Margin="0,0,14,0">
+              <Border x:Name="HeadTile" CornerRadius="11" Background="#3B5BDB">
+                <TextBlock x:Name="HeadInitial" FontSize="24" FontWeight="Bold" Foreground="White" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+              </Border>
+              <Border x:Name="HeadCover" CornerRadius="11" Visibility="Collapsed"/>
+            </Grid>
+            <StackPanel VerticalAlignment="Center">
+              <TextBlock x:Name="SelTitle" Text="请选择游戏和版本" FontSize="17" FontWeight="Bold" TextTrimming="CharacterEllipsis"/>
+              <TextBlock x:Name="SelSub" Foreground="#8C95A6" FontSize="11" TextTrimming="CharacterEllipsis" Margin="0,2,0,0"/>
+            </StackPanel>
+          </DockPanel>
           <TabControl x:Name="Tabs">
 
             <TabItem Header="启动与调试">
@@ -933,6 +1241,7 @@ $MainXaml = @'
                     </WrapPanel>
                     <DockPanel Margin="0,10,0,6">
                       <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                        <Button x:Name="BtnPresets" Content="预设…" Style="{StaticResource Small}"/>
                         <Button x:Name="BtnSwitches" Content="可用开关 / 版本对比" Style="{StaticResource Small}"/>
                         <Button x:Name="BtnClearEnv" Content="清空" Style="{StaticResource Small}" Margin="0"/>
                       </StackPanel>
@@ -945,6 +1254,11 @@ $MainXaml = @'
                       <Button x:Name="BtnKill" Content="结束运行中的实例" Style="{StaticResource Danger}" Margin="0,0,10,0" VerticalAlignment="Center"/>
                       <TextBlock x:Name="RunningText" VerticalAlignment="Center" Foreground="#3FB950"/>
                     </StackPanel>
+                    <DockPanel Margin="0,18,0,6">
+                      <Button x:Name="BtnEditTools" DockPanel.Dock="Right" Content="编辑工具" Style="{StaticResource Small}" Margin="0"/>
+                      <TextBlock Text="工具 · 来自 tools.json，可自定义" Foreground="#8C95A6" FontSize="12" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                    </DockPanel>
+                    <WrapPanel x:Name="ToolsPanel"/>
                   </StackPanel>
                   <Border Grid.Column="2" Style="{StaticResource SubCard}" VerticalAlignment="Top">
                     <StackPanel>
@@ -1205,13 +1519,21 @@ function Get-SelEmu  { $i = $ui.EmusList.SelectedItem;  if ($i) { return $i.Emu 
 function Get-SelGame { $i = $ui.GamesList.SelectedItem; if ($i) { return $i.Game }; return $null }
 function Get-SelLoc  { $i = $ui.LocGrid.SelectedItem;   if ($i) { return $i }; return $null }
 
+function New-GameVM($g) {
+    $name = Game-Display $g
+    $cover = Load-Image (Find-CoverPath $g) 128
+    $parts = @($g.Contents | Group-Object Kind | ForEach-Object { switch ($_.Name) { 'base' { '基础' } 'update' { "更新 ×$($_.Count)" } 'dlc' { "DLC ×$($_.Count)" } } })
+    $initial = if ($name) { $name.Substring(0, 1).ToUpper() } else { '?' }
+    return [pscustomobject]@{
+        Name = $name; TitleId = $g.TitleId; Tags = ($parts -join ' · '); Game = $g
+        Cover = $cover; CoverVis = $(if ($cover) { 'Visible' } else { 'Collapsed' })
+        Initial = $initial; TileBg = (Get-TileColor ([string]$g.TitleId))
+    }
+}
 function Fill-Games {
     $keep = $null; $g0 = Get-SelGame; if ($g0) { $keep = $g0.TitleId }
     $vms = @()
-    foreach ($g in $script:Games) {
-        $parts = @($g.Contents | Group-Object Kind | ForEach-Object { switch ($_.Name) { 'base' { '基础' } 'update' { "更新 ×$($_.Count)" } 'dlc' { "DLC ×$($_.Count)" } } })
-        $vms += [pscustomobject]@{ Name = (Game-Display $g); TitleId = $g.TitleId; Tags = ($parts -join ' · '); Game = $g }
-    }
+    foreach ($g in $script:Games) { $vms += New-GameVM $g }
     $script:Filling = $true
     $ui.GamesList.ItemsSource = $vms
     $idx = 0
@@ -1337,6 +1659,15 @@ function Load-Compat {
 }
 function Update-Header {
     $emu = Get-SelEmu; $game = Get-SelGame
+    $vm = $ui.GamesList.SelectedItem
+    if ($vm) {
+        $ui.HeadTile.Background = To-Brush $vm.TileBg; $ui.HeadInitial.Text = $vm.Initial
+        $big = Load-Image (Find-CoverPath $vm.Game) 160
+        if ($big) {
+            $ib = New-Object System.Windows.Media.ImageBrush($big); $ib.Stretch = 'UniformToFill'
+            $ui.HeadCover.Background = $ib; $ui.HeadCover.Visibility = 'Visible'
+        } else { $ui.HeadCover.Visibility = 'Collapsed' }
+    } else { $ui.HeadInitial.Text = ''; $ui.HeadCover.Visibility = 'Collapsed' }
     if ($emu -and $game) {
         $ui.SelTitle.Text = (Game-Display $game) + '   ×   ' + (Emu-Display $emu)
         $ui.SelSub.Text = $emu.Dir + '   ·   数据：' + $emu.DataDir
@@ -1386,6 +1717,8 @@ function Fill-RoomExes {
     if ($vms.Count -eq 0) { $ui.RoomAddr.Text = '没有找到 eden-room.exe（PokeDinner 等版本自带）。' }
 }
 function Rescan {
+    Load-Extensions
+    Fill-Tools
     Set-Status '正在扫描模拟器…'
     $script:Emus = Scan-Emus
     Set-Status '正在扫描游戏…'
@@ -1436,36 +1769,36 @@ function Start-Run {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $runId = $stamp + '_' + (Safe-Name (Emu-Display $emu)) + '_' + (Safe-Name (Game-Display $game))
     $exitFile = Join-Path $script:RunsDir ($runId + '.exit')
-    $argList = @()
-    if ($ui.ChkFull.IsChecked) { $argList += '-f' }
-    $argList += '-g'; $argList += ('"' + $target + '"')
+    $tpl = [string]$emu.Profile.launchArgs; if (-not $tpl) { $tpl = '{fullscreen} "{target}"' }
+    $fsArg = if ($ui.ChkFull.IsChecked) { [string]$emu.Profile.fullscreenArg } else { '' }
+    $argStr = (Expand-T $tpl $emu $game $target).Replace('{fullscreen}', $fsArg).Trim()
+    $envPairs = Parse-Env $ui.EnvBox.Text
+    $ctx = [pscustomobject]@{
+        Stage = 'pre-launch'; Emu = $emu; Game = $game; EmuName = (Emu-Display $emu); GameName = (Game-Display $game)
+        Target = $target; Env = $envPairs; Args = $argStr; Cli = $useCli
+    }
+    if (-not (Invoke-Hooks 'pre-launch' $ctx)) { return }
+    $argStr = [string]$ctx.Args; $envPairs = $ctx.Env
     $psi = New-Object Diagnostics.ProcessStartInfo
     $psi.UseShellExecute = $true
     $psi.WorkingDirectory = $emu.Dir
     if ($useCli) {
         $psi.FileName = $env:ComSpec
-        $psi.Arguments = '/v:on /c "title EmuManager - ' + (Safe-Name (Emu-Display $emu)) + ' & "' + $exe + '" ' + ($argList -join ' ') +
+        $psi.Arguments = '/v:on /c "title EmuManager - ' + (Safe-Name (Emu-Display $emu)) + ' & "' + $exe + '" ' + $argStr +
             ' & echo. & echo [EmuManager] exit code !errorlevel! & >"' + $exitFile + '" echo !errorlevel! & pause"'
     } else {
         $psi.FileName = $exe
-        $psi.Arguments = ($argList -join ' ')
+        $psi.Arguments = $argStr
     }
-    $envPairs = Parse-Env $ui.EnvBox.Text
-    $saved = @{}
-    foreach ($k in @($envPairs.Keys)) {
-        $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process')
-        [Environment]::SetEnvironmentVariable($k, [string]$envPairs[$k], 'Process')
-    }
-    try { $p = [Diagnostics.Process]::Start($psi) }
-    finally { foreach ($k in @($saved.Keys)) { [Environment]::SetEnvironmentVariable($k, $saved[$k], 'Process') } }
+    $p = Start-WithEnv $psi $envPairs
     if (-not $p) { Msg '启动失败（没有获得进程）。' 'Error'; return }
     $run = [pscustomobject]@{
-        Id = $runId; Process = $p; EmuKey = $emu.Key; EmuName = (Emu-Display $emu); DataDir = $emu.DataDir
+        Id = $runId; Process = $p; Emu = $emu; Game = $game; EmuKey = $emu.Key; EmuName = (Emu-Display $emu); DataDir = $emu.DataDir
         Tid = $game.TitleId; GameName = (Game-Display $game); Start = (Get-Date); Cli = $useCli
-        ExitFile = $exitFile; Env = $ui.EnvBox.Text; Target = $target
+        ExitFile = $exitFile; Env = $ui.EnvBox.Text; EnvPairs = $envPairs; Target = $target
     }
     [void]$script:Running.Add($run)
-    Set-Status ('已启动：' + $run.GameName + ' @ ' + $run.EmuName + '（' + $envPairs.Count + ' 个环境变量）')
+    Set-Status ('已启动：' + $run.GameName + ' @ ' + $run.EmuName + '（' + $envPairs.Count + ' 个环境变量）  参数：' + $argStr)
     Update-RunLabel
 }
 function Update-RunLabel {
@@ -1492,8 +1825,8 @@ function Finish-Run($r) {
         }
     } else { try { $code = $r.Process.ExitCode } catch { } }
     $logCopy = ''
-    $logDir = Join-Path $r.DataDir 'log'
-    if ([IO.Directory]::Exists($logDir)) {
+    $logDir = Expand-T ([string]$r.Emu.Profile.logDir) $r.Emu $r.Game
+    if ($logDir -and [IO.Directory]::Exists($logDir)) {
         $newest = Get-ChildItem -LiteralPath $logDir -File -ErrorAction SilentlyContinue |
             Where-Object { $_.LastWriteTime -ge $r.Start.AddSeconds(-5) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
         if ($newest) {
@@ -1512,6 +1845,12 @@ function Finish-Run($r) {
     if (-not $script:Db.compat.ContainsKey($k)) { $script:Db.compat[$k] = @{ status = '未测试'; note = '' } }
     $c = $script:Db.compat[$k]
     $c.lastRun = $rec.Time; $c.lastSeconds = $rec.Seconds; $c.lastExit = $rec.ExitCode
+    $ctx = [pscustomobject]@{
+        Stage = 'post-exit'; Emu = $r.Emu; Game = $r.Game; EmuName = $r.EmuName; GameName = $r.GameName
+        Target = $r.Target; Env = $r.EnvPairs; Args = ''; Cli = $r.Cli
+        ExitCode = $code; ExitText = $rec.ExitCode; Seconds = $rec.Seconds; Log = $logCopy
+    }
+    [void](Invoke-Hooks 'post-exit' $ctx)
     if ($ui.ChkAsk.IsChecked) { Ask-RunResult $rec $c }
     Save-Db
     Fill-Runs; Fill-Emus; Load-Compat
@@ -1613,17 +1952,22 @@ function Do-MakePortable($emu) {
     if (-not $emu) { $emu = Get-SelEmu }
     if (-not $emu) { return }
     if ($emu.Portable) { Msg "这个版本已经使用独立数据目录：`n$($emu.DataDir)"; return }
-    $src = $emu.DataDir; $dst = Join-Path $emu.Dir 'user'
-    $text = "将【$(Emu-Display $emu)】转为独立数据目录：`n会在 $dst 建立 user 文件夹，之后它不再与其它版本共享`n$src`n`n是 = 复制 keys、固件/存档(nand)、配置、mods（不含着色器缓存；nand 若装过游戏会比较大）`n否 = 只复制 keys 和固件（全新存档）`n取消 = 不操作"
+    $src = $emu.DataDir; $dst = Join-Path $emu.Dir $emu.PortableDir
+    $all = @($emu.Profile.portableCopyAll); $min = @($emu.Profile.portableCopyMin)
+    $text = "将【$(Emu-Display $emu)】转为独立数据目录：`n会在 $dst 建立文件夹，之后它不再与其它版本共享`n$src`n`n是 = 复制 " + ($all -join '、') + "（不含着色器缓存，可能较大）`n否 = 只复制 " + ($min -join '、') + "`n取消 = 不操作"
     $r = [System.Windows.MessageBox]::Show($script:win, $text, 'EmuManager', 'YesNoCancel', 'Question')
     if ($r -eq 'Cancel') { return }
     [void][IO.Directory]::CreateDirectory($dst)
-    $items = if ($r -eq 'Yes') { @('keys', 'nand', 'config', 'load', 'sdmc') } else { @('keys', 'nand\system') }
+    $items = if ($r -eq 'Yes') { $all } else { $min }
     foreach ($i in $items) {
+        if (-not $i) { continue }
         $s = Join-Path $src $i; $t = Join-Path $dst $i
         if ([IO.Directory]::Exists($s)) {
             Set-Status "正在复制 $i …"
             & robocopy.exe $s $t /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+        } elseif ([IO.File]::Exists($s)) {
+            $pd = [IO.Path]::GetDirectoryName($t); if (-not [IO.Directory]::Exists($pd)) { [void][IO.Directory]::CreateDirectory($pd) }
+            Copy-Item -LiteralPath $s -Destination $t -Force
         }
     }
     Set-Status '已转为独立数据目录。'
@@ -1881,14 +2225,235 @@ function Do-JoinWrite([bool]$launch) {
     $running = Get-EmuProcesses $emu
     if ($running.Count -gt 0) { Msg '这个版本正在运行，模拟器退出时会覆盖配置。请先关闭它再写入。' 'Warning'; return }
     Save-RoomForm
-    $ini = Join-Path $emu.DataDir 'config\qt-config.ini'
+    $mp = $emu.Profile.multiplayer
+    if (-not $mp -or -not $mp.file) { Msg "这个版本的模拟器档案（$($emu.ProfileId)）没有配置联机写入（profiles.json 里的 multiplayer）。"; return }
+    $ini = Expand-T ([string]$mp.file) $emu $null
+    $sec = if ($mp.section) { [string]$mp.section } else { 'Multiplayer' }
     if ([IO.File]::Exists($ini)) { Copy-Item -LiteralPath $ini -Destination ($ini + '.emumgr.bak') -Force }
-    Set-IniValue $ini 'Multiplayer' 'nickname' $nick
-    Set-IniValue $ini 'Multiplayer' 'ip' $ip
-    Set-IniValue $ini 'Multiplayer' 'port' $port
-    Set-Status "已写入 $ini（[Multiplayer] nickname/ip/port），原文件备份为 .emumgr.bak"
+    Set-IniValue $ini $sec ([string]$mp.nick) $nick
+    Set-IniValue $ini $sec ([string]$mp.ip) $ip
+    Set-IniValue $ini $sec ([string]$mp.port) $port
+    Set-Status "已写入 $ini（[$sec]），原文件备份为 .emumgr.bak"
     if ($launch) { $ui.Tabs.SelectedIndex = 0; Start-Run }
     else { Msg "已写入。启动游戏后在模拟器菜单「多人游戏 → 直接连接」里确认地址并连接。" }
+}
+
+# ================================================================ 工具 / 预设 / 封面 / 扩展 对话框
+function Fill-Tools {
+    $ui.ToolsPanel.Children.Clear()
+    $n = 0
+    foreach ($t in @($script:Tools)) {
+        if (-not $t -or -not $t.name -or $t.enabled -eq $false) { continue }
+        $b = New-Object System.Windows.Controls.Button
+        $b.Content = [string]$t.name; $b.Style = $script:App.Resources['Small']; $b.Margin = (Th 0 0 6 6); $b.Tag = $t
+        if ($t.tip) { $b.ToolTip = [string]$t.tip }
+        $b.Add_Click({ Safe { Run-Tool $this.Tag } })
+        [void]$ui.ToolsPanel.Children.Add($b); $n++
+    }
+    if ($n -eq 0) {
+        $tb = New-TB '（没有启用的工具，点「编辑工具」添加）' '#8C95A6' 12
+        [void]$ui.ToolsPanel.Children.Add($tb)
+    }
+}
+function Run-Tool($t) {
+    $emu = Get-SelEmu; $game = Get-SelGame
+    $target = if ($ui.TargetsList.SelectedItem) { [string]$ui.TargetsList.SelectedItem.Path } else { '' }
+    $cmd = Expand-T ([string]$t.command) $emu $game $target
+    if (-not $cmd) { Msg '这个工具没有设置 command。'; return }
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $cmd
+    $psi.Arguments = Expand-T ([string]$t.args) $emu $game $target
+    $psi.UseShellExecute = $true
+    $cwd = if ($t.cwd) { Expand-T ([string]$t.cwd) $emu $game $target } elseif ($emu) { $emu.Dir } else { $script:AppRoot }
+    if ($cwd -and [IO.Directory]::Exists($cwd)) { $psi.WorkingDirectory = $cwd }
+    $pairs = if ($t.env) { Parse-Env $ui.EnvBox.Text } else { $null }
+    [void](Start-WithEnv $psi $pairs)
+    Set-Status ('已运行工具：' + $t.name + '  ' + $psi.FileName + ' ' + $psi.Arguments)
+}
+function Show-Presets {
+    $w = New-Dialog '环境变量预设' 640
+    $sp = New-Object System.Windows.Controls.StackPanel; $sp.Margin = (Th 20)
+    $h = New-TB '把常用的开关组合存成预设，在任何版本 / 游戏上一键套用。' '#8C95A6' 12; $h.Margin = (Th 0 0 0 10)
+    [void]$sp.Children.Add($h)
+    $lb = New-Object System.Windows.Controls.ListBox; $lb.MaxHeight = 300; $lb.MinHeight = 80
+    $lb.DisplayMemberPath = 'Text'
+    [void]$sp.Children.Add($lb)
+    $refresh = {
+        $items = @()
+        foreach ($name in @($script:Db.presets.Keys | Sort-Object)) {
+            $v = [string]$script:Db.presets[$name]
+            $short = (($v -split "`r?`n") | Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') }) -join '; '
+            $items += [pscustomobject]@{ Name = $name; Text = $name + '      ' + $short }
+        }
+        $lb.ItemsSource = $items
+    }
+    & $refresh
+    $wp = New-Object System.Windows.Controls.WrapPanel; $wp.Margin = (Th 0 12 0 0)
+    $mk = {
+        param($text, $style, $action)
+        $b = New-Object System.Windows.Controls.Button; $b.Content = $text
+        if ($style) { $b.Style = $script:App.Resources[$style] }
+        $b.Add_Click($action)
+        [void]$wp.Children.Add($b)
+    }
+    & $mk '替换载入' 'Primary' { Safe { $i = $lb.SelectedItem; if ($i) { $ui.EnvBox.Text = [string]$script:Db.presets[$i.Name]; $w.Close() } } }
+    & $mk '追加' $null {
+        Safe {
+            $i = $lb.SelectedItem
+            if ($i) {
+                $tb = $ui.EnvBox
+                if ($tb.Text -and -not $tb.Text.EndsWith("`n")) { $tb.AppendText("`r`n") }
+                $tb.AppendText(([string]$script:Db.presets[$i.Name]).TrimEnd() + "`r`n"); $w.Close()
+            }
+        }
+    }
+    & $mk '把当前环境变量存为预设…' $null {
+        Safe {
+            if (-not $ui.EnvBox.Text.Trim()) { Msg '环境变量框是空的。'; return }
+            $v = Show-Form '保存预设' @(@{ L = '预设名称'; V = '' })
+            if ($v -and $v[0]) { $script:Db.presets[$v[0]] = $ui.EnvBox.Text; Save-Db; & $refresh }
+        }
+    }
+    & $mk '删除' 'Danger' { Safe { $i = $lb.SelectedItem; if ($i -and (Confirm "删除预设「$($i.Name)」？")) { $script:Db.presets.Remove($i.Name); Save-Db; & $refresh } } }
+    [void]$sp.Children.Add($wp)
+    $lb.Add_MouseDoubleClick({ Safe { $i = $lb.SelectedItem; if ($i) { $ui.EnvBox.Text = [string]$script:Db.presets[$i.Name]; $w.Close() } } })
+    $w.Content = $sp
+    [void]$w.ShowDialog()
+}
+function Save-CoverBytes([string]$tid, [byte[]]$bytes, [string]$ext) {
+    Remove-CustomCover $tid
+    $f = Join-Path $script:CoversDir "$tid.$ext"
+    [IO.File]::WriteAllBytes($f, $bytes)
+    return $f
+}
+function Save-CoverBitmap([string]$tid, $bmp) {
+    Remove-CustomCover $tid
+    $f = Join-Path $script:CoversDir "$tid.png"
+    $enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
+    $enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($bmp))
+    $fs = [IO.File]::Create($f)
+    try { $enc.Save($fs) } finally { $fs.Dispose() }
+    return $f
+}
+function Download-Cover([string]$tid) {
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+    foreach ($tpl in @($script:Cfg.CoverUrls)) {
+        if (-not $tpl) { continue }
+        $url = ([string]$tpl).Replace('{TID}', $tid).Replace('{tid}', $tid.ToLower())
+        try {
+            Set-Status "正在尝试 $url …"
+            $wc = New-Object Net.WebClient
+            $wc.Headers.Add('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EmuManager')
+            $bytes = $wc.DownloadData($url)
+            if ($bytes.Length -lt 1024) { continue }
+            $ext = 'jpg'
+            if ($bytes[0] -eq 0x89 -and $bytes[1] -eq 0x50) { $ext = 'png' }
+            elseif (-not ($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xD8)) { continue }
+            $f = Save-CoverBytes $tid $bytes $ext
+            if (Load-Image $f 64) { Set-Status "已从 $url 获取封面"; return $true }
+            Remove-Item -LiteralPath $f -Force
+        } catch { }
+    }
+    Set-Status '在线源都没有找到这个 TitleID 的封面（Switch 2 新游戏通常还没被收录），可以自己找图后用「选择图片」或「粘贴」。'
+    return $false
+}
+function Show-CoverDialog {
+    $vm = $ui.GamesList.SelectedItem
+    if (-not $vm) { return }
+    $game = $vm.Game; $tid = [string]$game.TitleId
+    if ($tid -like 'FILE:*') { Msg '这个游戏没有识别到 TitleID，无法保存封面。可以把图片命名为 cover.png 放进游戏目录。'; return }
+    $w = New-Dialog ('封面 — ' + (Game-Display $game)) 560
+    $root = New-Object System.Windows.Controls.DockPanel; $root.Margin = (Th 20)
+    $prev = New-Object System.Windows.Controls.Border
+    $prev.Width = 150; $prev.Height = 150; $prev.CornerRadius = New-Object System.Windows.CornerRadius(14); $prev.Margin = (Th 0 0 18 0)
+    [System.Windows.Controls.DockPanel]::SetDock($prev, 'Left')
+    $info = New-Object System.Windows.Controls.StackPanel
+    $src = New-TB '' '#8C95A6' 11
+    $paint = {
+        $path = Find-CoverPath $game
+        $img = Load-Image $path 300
+        if ($img) { $ib = New-Object System.Windows.Media.ImageBrush($img); $ib.Stretch = 'UniformToFill'; $prev.Background = $ib }
+        else { $prev.Background = To-Brush (Get-TileColor $tid) }
+        $src.Text = if ($path) { "当前来源：$path" } else { '当前没有封面（使用色块）' }
+    }
+    & $paint
+    $hint = New-TB ('封面查找顺序：自定义封面（data\covers\' + $tid + '.png）→ 游戏目录里的 cover / icon 图片 → 模拟器游戏列表缓存的图标。') '#8C95A6' 11
+    $hint.Margin = (Th 0 0 0 10)
+    [void]$info.Children.Add($hint)
+    $src.Margin = (Th 0 0 0 12)
+    [void]$info.Children.Add($src)
+    $wp = New-Object System.Windows.Controls.WrapPanel
+    $mk = {
+        param($text, $style, $action)
+        $b = New-Object System.Windows.Controls.Button; $b.Content = $text
+        if ($style) { $b.Style = $script:App.Resources[$style] }
+        $b.Add_Click($action)
+        [void]$wp.Children.Add($b)
+    }
+    & $mk '选择图片…' 'Primary' {
+        Safe {
+            $dlg = New-Object Microsoft.Win32.OpenFileDialog
+            $dlg.Filter = '图片|*.png;*.jpg;*.jpeg;*.bmp'
+            if ($dlg.ShowDialog($w) -eq $true) {
+                $ext = [IO.Path]::GetExtension($dlg.FileName).TrimStart('.').ToLower()
+                [void](Save-CoverBytes $tid ([IO.File]::ReadAllBytes($dlg.FileName)) $ext); & $paint
+            }
+        }
+    }
+    & $mk '从剪贴板粘贴' $null {
+        Safe {
+            if ([System.Windows.Clipboard]::ContainsImage()) { [void](Save-CoverBitmap $tid ([System.Windows.Clipboard]::GetImage())); & $paint; return }
+            if ([System.Windows.Clipboard]::ContainsFileDropList()) {
+                $f = @([System.Windows.Clipboard]::GetFileDropList()) | Where-Object { $_ -match '\.(png|jpe?g|bmp)$' } | Select-Object -First 1
+                if ($f) { $ext = [IO.Path]::GetExtension($f).TrimStart('.').ToLower(); [void](Save-CoverBytes $tid ([IO.File]::ReadAllBytes($f)) $ext); & $paint; return }
+            }
+            Msg '剪贴板里没有图片。可以在网页上右键「复制图片」后再点这里。'
+        }
+    }
+    & $mk '在线查找' $null { Safe { if (Download-Cover $tid) { & $paint } else { Msg $ui.StatusText.Text } } }
+    & $mk '移除自定义封面' 'Danger' { Safe { Remove-CustomCover $tid; & $paint } }
+    [void]$info.Children.Add($wp)
+    $close = New-Object System.Windows.Controls.Button; $close.Content = '完成'; $close.IsCancel = $true; $close.HorizontalAlignment = 'Right'; $close.Margin = (Th 0 10 0 0)
+    [void]$info.Children.Add($close)
+    [void]$root.Children.Add($prev); [void]$root.Children.Add($info)
+    $w.Content = $root
+    [void]$w.ShowDialog()
+    $script:CoverCache.Clear()
+    Fill-Games; Update-Header
+}
+function Edit-File([string]$path) {
+    if (-not [IO.File]::Exists($path)) { Msg "文件不存在：$path"; return }
+    Start-Process notepad.exe -ArgumentList ('"' + $path + '"')
+}
+function Show-ExtDialog {
+    $w = New-Dialog '扩展' 620
+    $sp = New-Object System.Windows.Controls.StackPanel; $sp.Margin = (Th 20)
+    $h = New-TB '以下配置都在 data 目录，用记事本修改后点「重新加载」即可生效，不需要改脚本。' '#8C95A6' 12; $h.Margin = (Th 0 0 0 12)
+    [void]$sp.Children.Add($h)
+    $row = {
+        param($title, $desc, $action)
+        $g = New-Object System.Windows.Controls.DockPanel; $g.Margin = (Th 0 0 0 10)
+        $b = New-Object System.Windows.Controls.Button; $b.Content = $title; $b.Width = 150; $b.Margin = (Th 0 0 12 0)
+        [System.Windows.Controls.DockPanel]::SetDock($b, 'Left')
+        $b.Add_Click($action)
+        $t = New-TB $desc '#8C95A6' 12; $t.VerticalAlignment = 'Center'
+        [void]$g.Children.Add($b); [void]$g.Children.Add($t)
+        [void]$sp.Children.Add($g)
+    }
+    & $row '模拟器档案' '新的模拟器 / 分支：exe 文件名、数据目录规则、启动参数模板、开关前缀、存档 / 着色器路径模板（profiles.json）' { Safe { Edit-File $script:ProfilesPath } }
+    & $row '游戏名称表' 'TitleID → 显示名称（titles.json），界面里的「重命名」优先级更高' { Safe { Edit-File $script:TitlesPath } }
+    & $row '自定义工具' '启动页「工具」区的按钮：命令 + 参数模板，可注入环境变量（tools.json）' { Safe { Edit-File $script:ToolsPath } }
+    & $row '钩子脚本' '启动前 / 退出后自动运行的 PowerShell 脚本（hooks\pre-launch、hooks\post-exit，说明见 README.txt）' { Safe { Open-InExplorer $script:HooksDir } }
+    & $row '封面目录' '自定义封面：<TitleID>.png / .jpg（data\covers）' { Safe { Open-InExplorer $script:CoversDir } }
+    & $row '封面在线源' '在线查找封面的 URL 模板（config.json 的 CoverUrls，{TID} 会被替换）' { Safe { Edit-File $script:ConfigPath } }
+    $btns = New-Object System.Windows.Controls.StackPanel; $btns.Orientation = 'Horizontal'; $btns.HorizontalAlignment = 'Right'; $btns.Margin = (Th 0 8 0 0)
+    $reload = New-Object System.Windows.Controls.Button; $reload.Content = '重新加载并扫描'; $reload.Style = $script:App.Resources['Primary']
+    $reload.Add_Click({ Safe { $script:Cfg = Read-Json $script:ConfigPath; $w.Close(); Rescan } })
+    $close = New-Object System.Windows.Controls.Button; $close.Content = '关闭'; $close.IsCancel = $true; $close.Margin = (Th 0)
+    [void]$btns.Children.Add($reload); [void]$btns.Children.Add($close)
+    [void]$sp.Children.Add($btns)
+    $w.Content = $sp
+    [void]$w.ShowDialog()
 }
 
 # ================================================================ 事件绑定
@@ -1896,6 +2461,10 @@ $ui.BtnRescan.Add_Click({ Safe { Rescan } })
 $ui.BtnSettings.Add_Click({ Safe { Do-Settings } })
 $ui.BtnDataDir.Add_Click({ Safe { Open-InExplorer $script:DataRoot } })
 $ui.BtnImport.Add_Click({ Safe { Do-ImportZip } })
+$ui.BtnExt.Add_Click({ Safe { Show-ExtDialog } })
+$ui.BtnGameCover.Add_Click({ Safe { Show-CoverDialog } })
+$ui.BtnPresets.Add_Click({ Safe { Show-Presets } })
+$ui.BtnEditTools.Add_Click({ Safe { Edit-File $script:ToolsPath; Set-Status '改完 tools.json 后按 F5（或「扩展 → 重新加载并扫描」）生效。' } })
 
 $ui.GamesList.Add_SelectionChanged({ Safe { if (-not $script:Filling -and $ui.GamesList.SelectedItem) { Fill-Emus; On-SelectionChanged } } })
 $ui.EmusList.Add_SelectionChanged({ Safe { if (-not $script:Filling -and $ui.EmusList.SelectedItem) { On-SelectionChanged } } })

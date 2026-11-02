@@ -13,6 +13,7 @@ Eden 系模拟器（Eden、Eglantine / PokeDinner 分支，以及 yuzu / citron 
 - 扫描磁盘找出所有模拟器目录，读取 `VERSION.txt` / `BUILD-INFO.txt` / 压缩包文件名中的 **分支和 commit**
 - 识别数据目录：版本目录里有 `user\` = 独立数据，否则使用 `%APPDATA%\eden`（共享）——共享的版本会醒目标出
 - 识别游戏：解包目录（从 `exefs\main.npdm` 读取 TitleID）以及 nsp / xci；`updates\<版本号>` 自动识别为更新
+- **游戏封面**：自定义封面（选择图片 / 从剪贴板粘贴 / 在线查找）→ 游戏目录里的 `cover`/`icon` 图片 → 模拟器游戏列表缓存的图标，都没有时显示彩色字母块
 - **导入 zip**：新构建解压到独立目录，多个版本并存，可一键设为独立数据
 - **隔离数据**：把共享 `%APPDATA%` 的版本转为独立 `user\` 目录（自动复制 keys / 固件 / 存档）
 
@@ -24,6 +25,7 @@ Eden 系模拟器（Eden、Eglantine / PokeDinner 分支，以及 yuzu / citron 
 - 退出后自动记录：时长、退出码（如 `0xC0000005 访问冲突`）、本次日志副本，并弹窗标记结果
 - **兼容性矩阵**：每个「版本 × 游戏」的状态（完美 / 可玩 / 卡顿 / 画面错误 / 崩溃…）和备注，版本列表用色条直接显示
 - 运行记录可一键「载入此配置」复现
+- **环境变量预设**：把常用开关组合存成预设，在任何版本 / 游戏上一键套用
 
 ### 存档 / 着色器 / 配置
 - 列出所选版本 × 游戏的存档、着色器缓存、Mods、SDMC、游戏专属配置、日志、keys、固件、NX2 开关文件
@@ -33,6 +35,20 @@ Eden 系模拟器（Eden、Eglantine / PokeDinner 分支，以及 yuzu / citron 
 - 使用版本自带的房间服务器（`eden-room.exe` 等）开房：房间名、端口、人数、密码、首选游戏 / TitleID，可选公开到大厅
 - 实时显示房间日志，一键放行防火墙 UDP 端口，复制局域网地址
 - 加入房间：把昵称 / 地址 / 端口写入所选版本的「多人游戏 → 直接连接」默认值，并可直接启动游戏
+
+### 扩展（不用改脚本）
+右上角「扩展」集中打开以下配置，改完按 F5 生效：
+
+| 文件 | 作用 |
+|---|---|
+| `data\profiles.json` | **模拟器档案**：exe / 命令行 / 房间服务器文件名、便携目录名、`%APPDATA%` 目录名、启动参数模板（如 `{fullscreen} -g "{target}"`）、开关前缀正则、存档 / 着色器 / Mods 等路径模板、联机配置写入位置。内置 Eden 家族和 Ryujinx 家族，新分支改了 exe 名或目录结构只需改这里 |
+| `data\titles.json` | TitleID → 游戏名称 |
+| `data\tools.json` | 启动页「工具」按钮：命令 + 参数模板，可注入环境变量（例：带开关的命令行、RenderDoc） |
+| `data\hooks\pre-launch\*.ps1` | 启动前运行，可修改本次的环境变量 / 启动参数，返回 `$false` 取消启动 |
+| `data\hooks\post-exit\*.ps1` | 退出后运行，拿到退出码、时长、日志副本（例：崩溃时自动打包日志） |
+| `data\covers\<TitleID>.png` | 自定义封面 |
+
+模板占位符：`{data}` `{emuDir}` `{exe}` `{gui}` `{cli}` `{tid}` `{tidl}`（小写）`{target}` `{gameDir}` `{gameName}` `{emuName}` `{appdata}` `{localappdata}` `{manager}` `{managerData}`
 
 ## 使用
 
@@ -52,6 +68,7 @@ Eden 系模拟器（Eden、Eglantine / PokeDinner 分支，以及 yuzu / citron 
 | `data\runs\` | 每次运行的日志副本 |
 | `data\backups\` | 备份 zip（`游戏\类型\版本_时间.zip`） |
 | `data\room\` | 房间服务器日志与封禁列表 |
+| `data\profiles.json` `titles.json` `tools.json` `hooks\` `covers\` | 扩展配置（见上） |
 
 ## 说明
 
