@@ -10,7 +10,7 @@ Add-Type -AssemblyName System.Xaml
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-$script:AppVersion = '2.2.0'
+$script:AppVersion = '2.3.0'
 
 # ================================================================ 路径与持久化
 $script:AppRoot    = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -20,6 +20,8 @@ $script:DbPath     = Join-Path $DataRoot 'db.json'
 $script:RunsDir    = Join-Path $DataRoot 'runs'
 $script:BackupRoot = Join-Path $DataRoot 'backups'
 $script:RoomDir    = Join-Path $DataRoot 'room'
+$script:IconPath   = Join-Path $AppRoot 'assets\icon.ico'
+$script:LogoPath   = Join-Path $AppRoot 'assets\icon-256.png'
 foreach ($d in @($DataRoot, $RunsDir, $BackupRoot, $RoomDir)) {
     if (-not [IO.Directory]::Exists($d)) { [void][IO.Directory]::CreateDirectory($d) }
 }
@@ -61,6 +63,7 @@ Ensure-Key $Cfg 'VersionsDir'   (Join-Path $Drive 'EmuVersions')
 Ensure-Key $Cfg 'EmuScanDepth'  3
 Ensure-Key $Cfg 'GameScanDepth' 5
 Ensure-Key $Cfg 'CoverUrls'     @('https://tinfoil.media/ti/{TID}/256/256/')
+Ensure-Key $Cfg 'AutoCovers'    $true
 Write-Json $ConfigPath $Cfg
 
 $script:Db = Read-Json $DbPath
@@ -70,6 +73,7 @@ Ensure-Key $Db 'compat' @{}
 Ensure-Key $Db 'profiles' @{}
 Ensure-Key $Db 'room' @{}
 Ensure-Key $Db 'presets' @{}
+Ensure-Key $Db 'coverTried' @{}
 Ensure-Key $Db 'runs' (New-Object System.Collections.ArrayList)
 if (-not ($Db.runs -is [System.Collections.ArrayList])) {
     $tmp = New-Object System.Collections.ArrayList; foreach ($x in $Db.runs) { [void]$tmp.Add($x) }; $Db.runs = $tmp
@@ -1118,15 +1122,7 @@ $MainXaml = @'
         <Button x:Name="BtnDataDir" Content="管理器数据" Margin="0"/>
       </StackPanel>
       <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-        <Border Width="40" Height="40" CornerRadius="11" Margin="0,0,12,0">
-          <Border.Background>
-            <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
-              <GradientStop Color="#5B8CFF" Offset="0"/>
-              <GradientStop Color="#B45BFF" Offset="1"/>
-            </LinearGradientBrush>
-          </Border.Background>
-          <TextBlock Text="E" FontSize="22" FontWeight="Bold" Foreground="White" HorizontalAlignment="Center" VerticalAlignment="Center"/>
-        </Border>
+        <Image x:Name="Logo" Width="42" Height="42" Margin="0,0,12,0" RenderOptions.BitmapScalingMode="HighQuality"/>
         <StackPanel VerticalAlignment="Center">
           <TextBlock Text="EmuManager" FontSize="20" FontWeight="Bold"/>
           <TextBlock x:Name="SubTitle" Text="Eden / Eglantine 多版本管理 · 调试 · 联机" Foreground="#8C95A6" FontSize="12"/>
@@ -1508,7 +1504,9 @@ $script:App.Resources = [Windows.Markup.XamlReader]::Parse($StylesXaml)
 $script:win = [Windows.Markup.XamlReader]::Parse($MainXaml)
 $script:ui = @{}
 foreach ($m in [regex]::Matches($MainXaml, 'x:Name="(\w+)"')) { $ui[$m.Groups[1].Value] = $win.FindName($m.Groups[1].Value) }
-$win.Title = "EmuManager $AppVersion"
+$win.Title = "NX2 Emu Manager $AppVersion"
+$script:AppIcon = $null
+try { if ([IO.File]::Exists($script:IconPath)) { $script:AppIcon = [System.Windows.Media.Imaging.BitmapFrame]::Create((New-Object Uri($script:IconPath))); $win.Icon = $script:AppIcon } } catch { }
 
 function Set-Status([string]$t) {
     $ui.StatusText.Text = $t
@@ -1526,6 +1524,7 @@ function New-Dialog([string]$title, [int]$width = 460) {
     $w.WindowStartupLocation = 'CenterOwner'; $w.Owner = $script:win
     $w.Background = To-Brush '#171A21'; $w.Foreground = To-Brush '#E6E8EE'
     $w.FontFamily = New-Object System.Windows.Media.FontFamily('Microsoft YaHei UI'); $w.FontSize = 13
+    if ($script:AppIcon) { $w.Icon = $script:AppIcon }
     return $w
 }
 function New-TB([string]$text, [string]$fg = '#E6E8EE', [double]$size = 13) {
@@ -1800,6 +1799,7 @@ function Rescan {
     Fill-RoomExes
     On-SelectionChanged
     Update-SharedWarning
+    Start-AutoCovers
 }
 function On-SelectionChanged {
     if ($script:Filling) { return }
@@ -2429,6 +2429,201 @@ function Download-Cover([string]$tid) {
     Set-Status '在线源都没有找到这个 TitleID 的封面（Switch 2 新游戏通常还没被收录），可以自己找图后用「选择图片」或「粘贴」。'
     return $false
 }
+function Fix-Url([string]$u) { if ($u -like '//*') { return 'https:' + $u }; return $u }
+function New-WebClient {
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+    $wc = New-Object Net.WebClient
+    $wc.Encoding = [Text.Encoding]::UTF8
+    $wc.Headers.Add('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EmuManager')
+    return $wc
+}
+function Search-NintendoEU([string]$q, [string]$fq, [int]$rows = 24) {
+    $url = 'https://searching.nintendo-europe.com/en/select?q=' + [Uri]::EscapeDataString($q) + '&fq=' + [Uri]::EscapeDataString($fq) + "&rows=$rows&wt=json"
+    $r = (New-WebClient).DownloadString($url) | ConvertFrom-Json
+    return @($r.response.docs)
+}
+function Get-DocImage($d) {
+    foreach ($f in @('image_url_sq_s', 'wishlist_email_square_image_url_s', 'image_url')) { $v = [string]$d.$f; if ($v) { return (Fix-Url $v) } }
+    return ''
+}
+function Save-CoverFromUrl([string]$tid, [string]$url) {
+    $bytes = (New-WebClient).DownloadData($url)
+    $ext = if ($bytes.Length -gt 1 -and $bytes[0] -eq 0x89 -and $bytes[1] -eq 0x50) { 'png' } else { 'jpg' }
+    [void](Save-CoverBytes $tid $bytes $ext)
+}
+function Add-OfficialTitle([string]$tid, [string]$title) {
+    if (-not $title -or $script:Titles.ContainsKey($tid)) { return }
+    if ($script:Db.games[$tid] -and $script:Db.games[$tid].alias) { return }
+    $t = Read-Json $script:TitlesPath
+    $t[$tid] = $title
+    Write-Json $script:TitlesPath $t
+    $script:Titles[$tid] = $title
+}
+# 后台按 TitleID 向任天堂官网查询封面（独立 runspace，不阻塞界面）
+$script:CoverWorker = @'
+param($tids, $coversDir)
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+foreach ($tid in $tids) {
+    try {
+        $wc = New-Object Net.WebClient
+        $wc.Encoding = [Text.Encoding]::UTF8
+        $wc.Headers.Add('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EmuManager')
+        $u = 'https://searching.nintendo-europe.com/en/select?q=*&fq=' + [Uri]::EscapeDataString('application_id_s:' + $tid.ToLower()) + '&rows=1&wt=json'
+        $r = $wc.DownloadString($u) | ConvertFrom-Json
+        $d = @($r.response.docs) | Select-Object -First 1
+        if (-not $d) { [pscustomobject]@{ Tid = $tid; Found = $false; Ok = $false; Title = ''; Err = '' }; continue }
+        $img = ''
+        foreach ($f in @('image_url_sq_s', 'wishlist_email_square_image_url_s', 'image_url')) { if (-not $img -and $d.$f) { $img = [string]$d.$f } }
+        if ($img -like '//*') { $img = 'https:' + $img }
+        $ok = $false
+        if ($img) {
+            $wc2 = New-Object Net.WebClient
+            $wc2.Headers.Add('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) EmuManager')
+            $bytes = $wc2.DownloadData($img)
+            $ext = if ($bytes.Length -gt 1 -and $bytes[0] -eq 0x89 -and $bytes[1] -eq 0x50) { 'png' } else { 'jpg' }
+            [IO.File]::WriteAllBytes((Join-Path $coversDir "$tid.$ext"), $bytes)
+            $ok = $true
+        }
+        [pscustomobject]@{ Tid = $tid; Found = $true; Ok = $ok; Title = [string]$d.title; Err = '' }
+    } catch {
+        [pscustomobject]@{ Tid = $tid; Found = $false; Ok = $false; Title = ''; Err = $_.Exception.Message }
+    }
+}
+'@
+$script:CoverJob = $null
+function Start-AutoCovers([bool]$force = $false) {
+    if (-not $force -and $script:Cfg.AutoCovers -eq $false) { return }
+    if ($script:CoverJob) { return }
+    $tids = @()
+    foreach ($g in $script:Games) {
+        $tid = [string]$g.TitleId
+        if ($tid -like 'FILE:*') { continue }
+        if (Find-CoverPath $g) { continue }
+        if (-not $force -and $script:Db.coverTried.ContainsKey($tid)) { continue }
+        $tids += $tid
+    }
+    if ($tids.Count -eq 0) { if ($force) { Set-Status '所有游戏都已有封面。' }; return }
+    $ps = [powershell]::Create()
+    [void]$ps.AddScript($script:CoverWorker).AddArgument($tids).AddArgument($script:CoversDir)
+    $script:CoverJob = @{ PS = $ps; Handle = $ps.BeginInvoke(); Count = $tids.Count }
+    $script:CoverTimer.Start()
+    Set-Status "正在从任天堂官网获取 $($tids.Count) 个游戏的封面…"
+}
+function Cover-Tick {
+    $j = $script:CoverJob
+    if (-not $j) { $script:CoverTimer.Stop(); return }
+    if (-not $j.Handle.IsCompleted) { return }
+    $script:CoverTimer.Stop()
+    $res = @()
+    try { $res = @($j.PS.EndInvoke($j.Handle)) } catch { }
+    $j.PS.Dispose(); $script:CoverJob = $null
+    $ok = 0; $miss = 0; $err = ''
+    foreach ($r in $res) {
+        if ($r.Err) { $err = $r.Err; continue }
+        $script:Db.coverTried[[string]$r.Tid] = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+        if ($r.Ok) { $ok++ } else { $miss++ }
+        if ($r.Title) { Add-OfficialTitle ([string]$r.Tid) ([string]$r.Title) }
+    }
+    Save-Db
+    if ($ok -gt 0) { $script:CoverCache.Clear(); Fill-Games; Update-Header }
+    $msg = "封面：获取 $ok 个"
+    if ($miss) { $msg += "，官网未收录 $miss 个（可在「封面…」里按名字搜索）" }
+    if ($err) { $msg += "，网络错误：$err" }
+    Set-Status $msg
+}
+function Get-SearchName($game) {
+    $n = Game-Display $game
+    if ($n -match '^[\x00-\x7F]+$') { $n = ($n -creplace '([a-z])([A-Z])', '$1 $2') -replace '[_\-\.]+', ' ' }
+    return $n.Trim()
+}
+function Show-CoverPicker($game) {
+    $x = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Width="860" Height="660" WindowStartupLocation="CenterOwner"
+        Background="#171A21" Foreground="#E6E8EE" FontFamily="Microsoft YaHei UI" FontSize="13">
+  <DockPanel Margin="18">
+    <TextBlock DockPanel.Dock="Top" Text="从任天堂官网搜索封面（支持英文名，也会显示 Switch 2 游戏）。双击图片使用。" Foreground="#8C95A6" FontSize="12" Margin="0,0,0,10"/>
+    <DockPanel DockPanel.Dock="Top" Margin="0,0,0,12">
+      <Button x:Name="Go" DockPanel.Dock="Right" Content="搜索" Style="{StaticResource Primary}" Margin="8,0,0,0"/>
+      <TextBox x:Name="Q" FontSize="14"/>
+    </DockPanel>
+    <DockPanel DockPanel.Dock="Bottom" Margin="0,10,0,0">
+      <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+        <Button x:Name="Use" Content="使用选中的图片" Style="{StaticResource Primary}"/>
+        <Button x:Name="Cancel" Content="关闭" IsCancel="True" Margin="0"/>
+      </StackPanel>
+      <TextBlock x:Name="Info" Foreground="#8C95A6" FontSize="11" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+    </DockPanel>
+    <ListBox x:Name="L">
+      <ListBox.ItemsPanel>
+        <ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate>
+      </ListBox.ItemsPanel>
+      <ListBox.ItemTemplate>
+        <DataTemplate>
+          <StackPanel Width="136">
+            <Border Width="136" Height="136" CornerRadius="8" Background="#2A2F3A">
+              <Image Source="{Binding Img}" Stretch="UniformToFill"/>
+            </Border>
+            <TextBlock Text="{Binding Title}" TextWrapping="Wrap" FontSize="12" Margin="0,6,0,0" MaxHeight="34"/>
+            <TextBlock Text="{Binding Sys}" FontSize="10" Foreground="#8C95A6" TextTrimming="CharacterEllipsis"/>
+          </StackPanel>
+        </DataTemplate>
+      </ListBox.ItemTemplate>
+    </ListBox>
+  </DockPanel>
+</Window>
+'@
+    $w = [Windows.Markup.XamlReader]::Parse($x)
+    $w.Owner = $script:win; if ($script:AppIcon) { $w.Icon = $script:AppIcon }
+    $w.Title = '搜索封面 — ' + (Game-Display $game)
+    $q = $w.FindName('Q'); $lb = $w.FindName('L'); $info = $w.FindName('Info')
+    $q.Text = Get-SearchName $game
+    $search = {
+        $info.Text = '正在搜索…'
+        try { $w.Dispatcher.Invoke([Action]{ }, [Windows.Threading.DispatcherPriority]::Background) } catch { }
+        try {
+            $docs = Search-NintendoEU $q.Text 'type:GAME' 30
+            $items = @()
+            foreach ($d in $docs) {
+                $img = Get-DocImage $d
+                if (-not $img) { continue }
+                $items += [pscustomobject]@{ Img = $img; Title = [string]$d.title; Sys = (@($d.system_names_txt) -join ' / '); AppId = [string]$d.application_id_s }
+            }
+            $lb.ItemsSource = $items
+            $info.Text = "找到 $($items.Count) 个结果"
+        } catch { $info.Text = '搜索失败：' + $_.Exception.Message }
+    }
+    $use = {
+        $it = $lb.SelectedItem
+        if (-not $it) { return }
+        try {
+            Save-CoverFromUrl ([string]$game.TitleId) $it.Img
+            $script:Db.coverTried[[string]$game.TitleId] = (Get-Date).ToString('yyyy-MM-dd HH:mm'); Save-Db
+            $w.DialogResult = $true
+        } catch { $info.Text = '下载失败：' + $_.Exception.Message }
+    }
+    $w.FindName('Go').Add_Click({ Safe { & $search } })
+    $q.Add_KeyDown({ if ($_.Key -eq 'Return') { Safe { & $search } } })
+    $w.FindName('Use').Add_Click({ Safe { & $use } })
+    $lb.Add_MouseDoubleClick({ Safe { & $use } })
+    $w.Add_ContentRendered({ Safe { & $search } })
+    return ($w.ShowDialog() -eq $true)
+}
+function New-DesktopShortcut {
+    $desk = [Environment]::GetFolderPath('Desktop')
+    $lnk = Join-Path $desk 'NX2 Emu Manager.lnk'
+    $sh = New-Object -ComObject WScript.Shell
+    $sc = $sh.CreateShortcut($lnk)
+    $sc.TargetPath = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $sc.Arguments = '-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "' + (Join-Path $script:AppRoot 'Launch.ps1') + '"'
+    $sc.WorkingDirectory = $script:AppRoot
+    $sc.WindowStyle = 7
+    if ([IO.File]::Exists($script:IconPath)) { $sc.IconLocation = $script:IconPath + ',0' }
+    $sc.Description = 'NX2 Emu Manager'
+    $sc.Save()
+    Set-Status "已在桌面创建快捷方式：$lnk"
+}
 function Show-CoverDialog {
     $vm = $ui.GamesList.SelectedItem
     if (-not $vm) { return }
@@ -2449,7 +2644,7 @@ function Show-CoverDialog {
         $src.Text = if ($path) { "当前来源：$path" } else { '当前没有封面（使用色块）' }
     }
     & $paint
-    $hint = New-TB ('封面查找顺序：自定义封面（data\covers\' + $tid + '.png）→ 游戏目录里的 cover / icon 图片 → 模拟器游戏列表缓存的图标。') '#8C95A6' 11
+    $hint = New-TB ('封面查找顺序：自定义 / 官网下载的封面（data\covers\' + $tid + '.png）→ 游戏目录里的 cover / icon 图片 → 模拟器游戏列表缓存的图标。') '#8C95A6' 11
     $hint.Margin = (Th 0 0 0 10)
     [void]$info.Children.Add($hint)
     $src.Margin = (Th 0 0 0 12)
@@ -2482,7 +2677,25 @@ function Show-CoverDialog {
             Msg '剪贴板里没有图片。可以在网页上右键「复制图片」后再点这里。'
         }
     }
-    & $mk '在线查找' $null { Safe { if (Download-Cover $tid) { & $paint } else { Msg $ui.StatusText.Text } } }
+    & $mk '官网自动匹配' $null {
+        Safe {
+            Set-Status '正在按 TitleID 查询任天堂官网…'
+            $docs = Search-NintendoEU '*' ('application_id_s:' + $tid.ToLower()) 1
+            $d = $docs | Select-Object -First 1
+            $img = if ($d) { Get-DocImage $d } else { '' }
+            if ($img) {
+                Save-CoverFromUrl $tid $img
+                Add-OfficialTitle $tid ([string]$d.title)
+                $script:Db.coverTried[$tid] = (Get-Date).ToString('yyyy-MM-dd HH:mm'); Save-Db
+                Set-Status ('已获取官方封面：' + $d.title); & $paint
+            } elseif (Download-Cover $tid) { & $paint }
+            else {
+                Set-Status '官网没有按 TitleID 收录这个游戏，改用名字搜索。'
+                if (Show-CoverPicker $game) { & $paint }
+            }
+        }
+    }
+    & $mk '按名字搜索…' $null { Safe { if (Show-CoverPicker $game) { & $paint } } }
     & $mk '移除自定义封面' 'Danger' { Safe { Remove-CustomCover $tid; & $paint } }
     [void]$info.Children.Add($wp)
     $close = New-Object System.Windows.Controls.Button; $close.Content = '完成'; $close.IsCancel = $true; $close.HorizontalAlignment = 'Right'; $close.Margin = (Th 0 10 0 0)
@@ -2517,7 +2730,9 @@ function Show-ExtDialog {
     & $row '自定义工具' '启动页「工具」区的按钮：命令 + 参数模板，可注入环境变量（tools.json）' { Safe { Edit-File $script:ToolsPath } }
     & $row '钩子脚本' '启动前 / 退出后自动运行的 PowerShell 脚本（hooks\pre-launch、hooks\post-exit，说明见 README.txt）' { Safe { Open-InExplorer $script:HooksDir } }
     & $row '封面目录' '自定义封面：<TitleID>.png / .jpg（data\covers）' { Safe { Open-InExplorer $script:CoversDir } }
-    & $row '封面在线源' '在线查找封面的 URL 模板（config.json 的 CoverUrls，{TID} 会被替换）' { Safe { Edit-File $script:ConfigPath } }
+    & $row '封面在线源' '自动按 TitleID 从任天堂官网取封面（config.json 的 AutoCovers 可关闭）；CoverUrls 为额外的 URL 模板' { Safe { Edit-File $script:ConfigPath } }
+    & $row '补全所有封面' '立即为所有还没有封面的游戏重新查询官网（包括之前没找到的）' { Safe { $w.Close(); Start-AutoCovers $true } }
+    & $row '桌面快捷方式' '在桌面创建带图标的「NX2 Emu Manager」快捷方式（不弹出控制台窗口）' { Safe { New-DesktopShortcut } }
     $btns = New-Object System.Windows.Controls.StackPanel; $btns.Orientation = 'Horizontal'; $btns.HorizontalAlignment = 'Right'; $btns.Margin = (Th 0 8 0 0)
     $reload = New-Object System.Windows.Controls.Button; $reload.Content = '重新加载并扫描'; $reload.Style = $script:App.Resources['Primary']
     $reload.Add_Click({ Safe { $script:Cfg = Read-Json $script:ConfigPath; $w.Close(); Rescan } })
@@ -2878,6 +3093,9 @@ $ui.Tabs.Add_SelectionChanged({
 $script:RunTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:RunTimer.Interval = [TimeSpan]::FromSeconds(2)
 $script:RunTimer.Add_Tick({ Safe { Check-Runs } })
+$script:CoverTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:CoverTimer.Interval = [TimeSpan]::FromSeconds(1)
+$script:CoverTimer.Add_Tick({ Safe { Cover-Tick } })
 $script:RoomTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:RoomTimer.Interval = [TimeSpan]::FromSeconds(1)
 $script:RoomTimer.Add_Tick({ Safe { Room-Tick } })
@@ -2885,6 +3103,8 @@ $script:RoomTimer.Add_Tick({ Safe { Room-Tick } })
 $win.Add_KeyDown({ if ($_.Key -eq 'F5') { Safe { Rescan } } })
 $win.Add_ContentRendered({
     Safe {
+        $logo = Load-Image $script:LogoPath 128
+        if ($logo) { $ui.Logo.Source = $logo }
         Rescan
         Load-RoomForm
         Update-RoomAddr

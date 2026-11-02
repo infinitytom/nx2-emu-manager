@@ -1,3 +1,5 @@
+<img src="assets/icon-256.png" width="96" align="right" alt="icon">
+
 # NX2 Emu Manager · Eden / Eglantine 多版本管理器
 
 Eden 系模拟器（Eden、Eglantine / PokeDinner 分支，以及 yuzu / citron / sudachi / suyu 等同源分支）的 **多版本管理、调试和联机工具**。
@@ -13,7 +15,7 @@ Eden 系模拟器（Eden、Eglantine / PokeDinner 分支，以及 yuzu / citron 
 - 扫描磁盘找出所有模拟器目录，读取 `VERSION.txt` / `BUILD-INFO.txt` / 压缩包文件名中的 **分支和 commit**
 - 识别数据目录：版本目录里有 `user\` = 独立数据，否则使用 `%APPDATA%\eden`（共享）——共享的版本会醒目标出
 - 识别游戏：解包目录（从 `exefs\main.npdm` 读取 TitleID）以及 nsp / xci；`updates\<版本号>` 自动识别为更新
-- **游戏封面**：自定义封面（选择图片 / 从剪贴板粘贴 / 在线查找）→ 游戏目录里的 `cover`/`icon` 图片 → 模拟器游戏列表缓存的图标，都没有时显示彩色字母块
+- **游戏封面**：扫描后在后台按 TitleID 从任天堂官网（欧洲站，含 Switch 2 游戏）自动下载方形官方封面并补全官方名称；查不到时可按名字搜索、从缩略图里挑选，或自己选择图片 / 从剪贴板粘贴。也会使用游戏目录里的 `cover`/`icon` 图片和模拟器游戏列表缓存的图标
 - **导入 zip**：新构建解压到独立目录，多个版本并存，可一键设为独立数据
 - **隔离数据**：把共享 `%APPDATA%` 的版本转为独立 `user\` 目录（自动复制 keys / 固件 / 存档）
 
@@ -62,6 +64,7 @@ Eden 系模拟器（Eden、Eglantine / PokeDinner 分支，以及 yuzu / citron 
    - 启动器会先做语法检查，启动失败时弹窗显示原因并写入 `startup-error.log`
    - 也可以用 `EmuManager-debug.bat`，保留控制台输出
 3. 首次启动默认扫描脚本所在磁盘的根目录；可在右上角「扫描目录」里修改
+4. 「扩展 → 桌面快捷方式」可在桌面创建带图标、不弹控制台的快捷方式
 
 > 系统要求：Windows 10 / 11（自带 PowerShell 5.1 和 .NET Framework 4.x）。
 
