@@ -10,7 +10,7 @@ Add-Type -AssemblyName System.Xaml
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-$script:AppVersion = '2.1.0'
+$script:AppVersion = '2.2.0'
 
 # ================================================================ 路径与持久化
 $script:AppRoot    = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -173,6 +173,39 @@ foreach ($d in @($HooksDir, (Join-Path $HooksDir 'pre-launch'), (Join-Path $Hook
     if (-not [IO.Directory]::Exists($d)) { [void][IO.Directory]::CreateDirectory($d) }
 }
 
+function SDef([string]$group, [string]$sec, [string]$key, [string]$label, [string]$type, [string]$opts = '', [string]$hint = '') {
+    $d = [ordered]@{ group = $group; section = $sec; key = $key; label = $label; type = $type }
+    if ($opts) { $d.options = @($opts -split ';' | ForEach-Object { $kv = $_ -split '=', 2; [ordered]@{ v = $kv[0]; l = $kv[1] } }) }
+    if ($hint) { $d.hint = $hint }
+    return $d
+}
+function Get-EdenSettings {
+    return @(
+        (SDef '图形' 'Renderer' 'backend' '图形 API' 'enum' '0=OpenGL;1=Vulkan;2=Null'),
+        (SDef '图形' 'Renderer' 'resolution_setup' '内部分辨率档位' 'int' '' '数值含义以模拟器界面为准（Eden FE 预设 3 = 1x）'),
+        (SDef '图形' 'Renderer' 'gpu_accuracy' 'GPU 精度' 'int' '' '数值含义以模拟器界面为准（Eden FE 预设 0 = Fast）'),
+        (SDef '图形' 'Renderer' 'scaling_filter' '缩放过滤' 'enum' '0=最近邻;1=双线性;2=双三次;3=高斯;4=ScaleForce;5=FSR'),
+        (SDef '图形' 'Renderer' 'anti_aliasing' '抗锯齿' 'enum' '0=无;1=FXAA;2=SMAA'),
+        (SDef '图形' 'Renderer' 'vsync_mode' '垂直同步' 'enum' '0=Immediate（关）;1=Mailbox;2=FIFO（开）;3=FIFO Relaxed'),
+        (SDef '图形' 'Renderer' 'fullscreen_mode' '全屏方式' 'enum' '0=无边框窗口;1=独占全屏'),
+        (SDef '图形' 'Renderer' 'shader_backend' '着色器后端（OpenGL）' 'enum' '0=GLSL;1=GLASM;2=SPIR-V'),
+        (SDef '性能 / 着色器' 'Renderer' 'use_asynchronous_shaders' '异步着色器编译' 'bool'),
+        (SDef '性能 / 着色器' 'Renderer' 'use_disk_shader_cache' '磁盘着色器缓存' 'bool'),
+        (SDef '性能 / 着色器' 'Renderer' 'use_asynchronous_gpu_emulation' '异步 GPU 模拟' 'bool'),
+        (SDef '性能 / 着色器' 'Renderer' 'async_presentation' '异步呈现' 'bool'),
+        (SDef '性能 / 着色器' 'Renderer' 'force_max_clock' '强制 GPU 最高频率' 'bool'),
+        (SDef '性能 / 着色器' 'Renderer' 'sync_memory_operations' '同步内存操作' 'bool'),
+        (SDef '性能 / 着色器' 'Renderer' 'accelerate_astc' 'ASTC 解码' 'enum' '0=CPU;1=GPU;2=CPU 异步'),
+        (SDef '性能 / 着色器' 'Renderer' 'astc_recompression' 'ASTC 重压缩' 'enum' '0=不压缩;1=BC1;2=BC3'),
+        (SDef '性能 / 着色器' 'Renderer' 'nvdec_emulation' '视频解码 (NVDEC)' 'enum' '0=关闭;1=CPU;2=GPU'),
+        (SDef '系统 / CPU' 'System' 'use_docked_mode' '主机模式' 'enum' '0=掌机;1=主机 (TV)'),
+        (SDef '系统 / CPU' 'Core' 'memory_layout_mode' '内存布局' 'enum' '0=4 GB;1=6 GB;2=8 GB;3=10 GB;4=12 GB'),
+        (SDef '系统 / CPU' 'Core' 'use_multi_core' '多核 CPU 模拟' 'bool'),
+        (SDef '系统 / CPU' 'Cpu' 'cpu_accuracy' 'CPU 精度' 'enum' '0=自动;1=精确;2=不安全;3=偏执'),
+        (SDef '调试' 'Debugging' 'use_auto_stub' '自动 Stub 未实现服务' 'bool'),
+        (SDef '调试' 'Miscellaneous' 'log_filter' '日志过滤' 'text' '' '例如 "*:Info"（带引号）')
+    )
+}
 function Get-DefaultProfiles {
     return @(
         [ordered]@{
@@ -201,6 +234,9 @@ function Get-DefaultProfiles {
                 [ordered]@{ type = '固件 (registered)'; kind = 'fw'; path = '{data}\nand\system\Contents\registered'; big = $true }
             )
             multiplayer = [ordered]@{ file = '{data}\config\qt-config.ini'; section = 'Multiplayer'; nick = 'nickname'; ip = 'ip'; port = 'port' }
+            configFile = '{data}\config\qt-config.ini'
+            gameConfigFile = '{data}\config\custom\{tid}.ini'
+            settings = (Get-EdenSettings)
             portableCopyAll = @('keys', 'nand', 'config', 'load', 'sdmc')
             portableCopyMin = @('keys', 'nand\system')
         },
@@ -229,6 +265,9 @@ function Get-DefaultProfiles {
                 [ordered]@{ type = 'Keys'; kind = 'keys'; path = '{data}\system' }
             )
             multiplayer = $null
+            configFile = '{data}\Config.json'
+            gameConfigFile = ''
+            settings = @()
             portableCopyAll = @('system', 'bis', 'Config.json')
             portableCopyMin = @('system')
         }
@@ -259,7 +298,11 @@ function Load-Extensions {
     } else {
         $ids = @($p | ForEach-Object { [string]$_.id }); $added = $false
         foreach ($d in $defs) {
-            if ($ids -notcontains $d.id) { [void]$p.Add((ConvertTo-HT (ConvertTo-Json -InputObject $d -Depth 8 | ConvertFrom-Json))); $added = $true }
+            $dh = ConvertTo-HT (ConvertTo-Json -InputObject $d -Depth 8 | ConvertFrom-Json)
+            if ($ids -notcontains $d.id) { [void]$p.Add($dh); $added = $true; continue }
+            # 已有的内置档案：只补上新版本增加的字段，不覆盖用户的修改
+            $cur = $p | Where-Object { [string]$_.id -eq $d.id } | Select-Object -First 1
+            foreach ($k in @($dh.Keys)) { if (-not $cur.ContainsKey($k)) { $cur[$k] = $dh[$k]; $added = $true } }
         }
         if ($added) { Write-Json $script:ProfilesPath $p }
     }
@@ -343,7 +386,6 @@ function Expand-T([string]$tpl, $emu, $game, [string]$target = '') {
         '{emuName}' = $(if ($emu) { Emu-Display $emu } else { '' })
         '{tidl}' = $tid.ToLower()
         '{tid}' = $tid
-        '{TID}' = $tid
         '{gameDir}' = $(if ($game) { [string]$game.Dir } else { '' })
         '{gameName}' = $(if ($game) { Game-Display $game } else { '' })
         '{target}' = $target
@@ -354,6 +396,7 @@ function Expand-T([string]$tpl, $emu, $game, [string]$target = '') {
     }
     $s = $tpl
     foreach ($k in $map.Keys) { $s = $s.Replace($k, [string]$map[$k]) }
+    $s = $s.Replace('{TID}', $tid)
     return $s
 }
 
@@ -747,7 +790,7 @@ function Get-LanIPs {
     } catch { }
     return $r
 }
-function Set-IniValue([string]$file, [string]$section, [string]$key, [string]$value) {
+function Set-IniRaw([string]$file, [string]$section, [string]$key, [string]$value) {
     $lines = New-Object System.Collections.Generic.List[string]
     if ([IO.File]::Exists($file)) { foreach ($l in [IO.File]::ReadAllLines($file)) { $lines.Add($l) } }
     else { $dir = [IO.Path]::GetDirectoryName($file); if (-not [IO.Directory]::Exists($dir)) { [void][IO.Directory]::CreateDirectory($dir) } }
@@ -755,19 +798,23 @@ function Set-IniValue([string]$file, [string]$section, [string]$key, [string]$va
     for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i].Trim() -ieq "[$section]") { $hdr = $i; break } }
     if ($hdr -lt 0) {
         if ($lines.Count -gt 0) { $lines.Add('') }
-        $lines.Add("[$section]"); $lines.Add("$key\default=false"); $lines.Add("$key=$value")
+        $lines.Add("[$section]"); $lines.Add("$key=$value")
     } else {
         $end = $lines.Count
         for ($i = $hdr + 1; $i -lt $lines.Count; $i++) { if ($lines[$i].TrimStart().StartsWith('[')) { $end = $i; break } }
-        $gotV = $false; $gotD = $false
-        for ($i = $hdr + 1; $i -lt $end; $i++) {
-            if ($lines[$i].StartsWith("$key=")) { $lines[$i] = "$key=$value"; $gotV = $true }
-            elseif ($lines[$i].StartsWith("$key\default=")) { $lines[$i] = "$key\default=false"; $gotD = $true }
+        $got = $false
+        for ($i = $hdr + 1; $i -lt $end; $i++) { if ($lines[$i].StartsWith("$key=")) { $lines[$i] = "$key=$value"; $got = $true } }
+        if (-not $got) {
+            $ins = $end
+            while ($ins -gt $hdr + 1 -and -not $lines[$ins - 1].Trim()) { $ins-- }
+            $lines.Insert($ins, "$key=$value")
         }
-        if (-not $gotV) { $lines.Insert($hdr + 1, "$key=$value") }
-        if (-not $gotD) { $lines.Insert($hdr + 1, "$key\default=false") }
     }
     [IO.File]::WriteAllLines($file, $lines, (New-Object Text.UTF8Encoding($false)))
+}
+function Set-IniValue([string]$file, [string]$section, [string]$key, [string]$value) {
+    Set-IniRaw $file $section "$key\default" 'false'
+    Set-IniRaw $file $section $key $value
 }
 function Get-EmuProcesses($emu) {
     $r = @()
@@ -1415,6 +1462,30 @@ $MainXaml = @'
                 </DataGrid>
               </DockPanel>
             </TabItem>
+            <TabItem Header="模拟器设置">
+              <DockPanel>
+                <DockPanel DockPanel.Dock="Top" Margin="0,0,0,6">
+                  <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                    <Button x:Name="BtnSetRaw" Content="编辑原始文件" Style="{StaticResource Small}"/>
+                    <Button x:Name="BtnSetBackup" Content="备份" Style="{StaticResource Small}"/>
+                    <Button x:Name="BtnSetOpen" Content="打开位置" Style="{StaticResource Small}" Margin="0"/>
+                  </StackPanel>
+                  <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <RadioButton x:Name="RbSetGlobal" Content="全局设置" IsChecked="True" Margin="0,0,18,0"/>
+                    <RadioButton x:Name="RbSetGame" Content="本游戏专属（覆盖全局）"/>
+                  </StackPanel>
+                </DockPanel>
+                <TextBlock x:Name="SetPath" DockPanel.Dock="Top" Foreground="#8C95A6" FontSize="11" TextTrimming="CharacterEllipsis" Margin="0,0,0,8"/>
+                <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Margin="0,10,0,0">
+                  <Button x:Name="BtnSetSave" Content="保存设置" Style="{StaticResource Primary}"/>
+                  <Button x:Name="BtnSetReload" Content="放弃修改"/>
+                  <TextBlock x:Name="SetDirty" Foreground="#E3B341" VerticalAlignment="Center" Margin="0,0,0,8"/>
+                </StackPanel>
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                  <StackPanel x:Name="SetPanel" Margin="0,0,8,0"/>
+                </ScrollViewer>
+              </DockPanel>
+            </TabItem>
           </TabControl>
         </DockPanel>
       </Border>
@@ -1737,6 +1808,7 @@ function On-SelectionChanged {
     Load-Compat
     Update-Header
     Fill-Locations $false
+    if ($ui.Tabs.SelectedIndex -eq 4) { Fill-Settings }
 }
 
 # ================================================================ 启动 / 运行跟踪
@@ -2456,6 +2528,191 @@ function Show-ExtDialog {
     [void]$w.ShowDialog()
 }
 
+# ================================================================ 模拟器设置
+function Read-Ini([string]$file) {
+    $d = [ordered]@{}; $sec = ''
+    if (-not [IO.File]::Exists($file)) { return $d }
+    foreach ($l in [IO.File]::ReadAllLines($file)) {
+        $t = $l.Trim()
+        if ($t -match '^\[(.+)\]$') { $sec = $Matches[1]; if (-not $d.Contains($sec)) { $d[$sec] = [ordered]@{} }; continue }
+        $i = $t.IndexOf('=')
+        if ($i -le 0) { continue }
+        if (-not $d.Contains($sec)) { $d[$sec] = [ordered]@{} }
+        $d[$sec][$t.Substring(0, $i)] = $t.Substring($i + 1)
+    }
+    return $d
+}
+function Get-IniVal($ini, [string]$sec, [string]$key) {
+    if ($ini.Contains($sec) -and $ini[$sec].Contains($key)) { return [string]$ini[$sec][$key] }
+    return $null
+}
+$script:SetState = $null
+function Set-Edit([string]$k, [string]$v) {
+    if (-not $script:SetState) { return }
+    $script:SetState.Edits[$k] = $v
+    $ui.SetDirty.Text = "  未保存的修改：$($script:SetState.Edits.Count) 项"
+}
+function Paint-Opts($panel, [string]$sel) {
+    foreach ($b in $panel.Children) {
+        if ([string]$b.Tag.V -eq $sel) { $b.Background = To-Brush '#2F5FD0'; $b.BorderBrush = To-Brush '#5B8CFF' }
+        else { $b.Background = To-Brush '#232833'; $b.BorderBrush = To-Brush '#3A4150' }
+    }
+}
+function Fill-Settings {
+    $panel = $ui.SetPanel
+    $panel.Children.Clear()
+    $ui.SetDirty.Text = ''
+    $script:SetState = $null
+    $emu = Get-SelEmu; $game = Get-SelGame
+    if (-not $emu) { [void]$panel.Children.Add((New-TB '请先选择一个模拟器版本。' '#8C95A6' 13)); return }
+    $prof = $emu.Profile
+    $isGame = [bool]$ui.RbSetGame.IsChecked
+    $tpl = if ($isGame) { [string]$prof.gameConfigFile } else { [string]$prof.configFile }
+    if (-not $tpl) { $ui.SetPath.Text = ''; [void]$panel.Children.Add((New-TB '该模拟器档案（profiles.json）没有配置设置文件路径。' '#8C95A6' 13)); return }
+    if ($isGame -and (-not $game -or $game.TitleId -like 'FILE:*')) { $ui.SetPath.Text = ''; [void]$panel.Children.Add((New-TB '请先选择一个识别到 TitleID 的游戏。' '#8C95A6' 13)); return }
+    $file = Expand-T $tpl $emu $game
+    $exists = [IO.File]::Exists($file)
+    $ui.SetPath.Text = $file + $(if ($exists) { '' } else { '    （文件还不存在，保存时创建）' })
+    $ini = Read-Ini $file
+    $script:SetState = @{ File = $file; Game = $isGame; Emu = $emu; GameObj = $game; Edits = @{} }
+    $defs = @($prof.settings)
+    if ($defs.Count -eq 0 -or -not $defs[0]) {
+        [void]$panel.Children.Add((New-TB '该模拟器档案没有定义常用设置项（profiles.json 里的 settings），可以用「编辑原始文件」直接修改。' '#8C95A6' 13))
+        return
+    }
+    $hint = if ($isGame) { '本游戏专属设置会覆盖全局；「跟随全局」表示这一项没有单独设置。' } else { '「默认」表示这一项使用模拟器的内置默认值。修改后点下方「保存设置」。' }
+    $h = New-TB $hint '#8C95A6' 12; $h.Margin = (Th 0 0 0 4)
+    [void]$panel.Children.Add($h)
+    $lastGroup = $null
+    foreach ($d in $defs) {
+        if (-not $d -or -not $d.key) { continue }
+        $sec = [string]$d.section; $key = [string]$d.key; $k = "$sec|$key"
+        $grp = [string]$d.group
+        if ($grp -ne $lastGroup) {
+            $gh = New-TB $grp '#E6E8EE' 14; $gh.FontWeight = [System.Windows.FontWeights]::SemiBold; $gh.Margin = (Th 0 16 0 6)
+            [void]$panel.Children.Add($gh); $lastGroup = $grp
+        }
+        $v = Get-IniVal $ini $sec $key
+        $isDef = ((Get-IniVal $ini $sec "$key\default") -eq 'true') -or ($null -eq $v)
+        $useGlobal = $isGame -and ((Get-IniVal $ini $sec "$key\use_global") -ne 'false')
+        $stateText = if ($useGlobal) { '跟随全局' } elseif ($isDef) { '默认' } else { '' }
+
+        $row = New-Object System.Windows.Controls.Border
+        $row.Background = To-Brush '#1F232C'; $row.CornerRadius = New-Object System.Windows.CornerRadius(8)
+        $row.Padding = (Th 12 8 12 8); $row.Margin = (Th 0 0 0 6)
+        $dp = New-Object System.Windows.Controls.DockPanel
+        $right = New-Object System.Windows.Controls.StackPanel; $right.Orientation = 'Horizontal'; $right.VerticalAlignment = 'Center'
+        [System.Windows.Controls.DockPanel]::SetDock($right, 'Right')
+        $st = New-TB $stateText '#8C95A6' 11; $st.VerticalAlignment = 'Center'; $st.Margin = (Th 0 0 10 0); $st.MinWidth = 54
+        $rb = New-Object System.Windows.Controls.Button; $rb.Content = $(if ($isGame) { '跟随全局' } else { '恢复默认' })
+        $rb.Style = $script:App.Resources['Small']; $rb.Margin = (Th 0); $rb.Tag = @{ K = $k; S = $st; G = $isGame }
+        $rb.Add_Click({ $t = $this.Tag; Set-Edit $t.K '__reset__'; $t.S.Text = $(if ($t.G) { '将跟随全局' } else { '将恢复默认' }); $t.S.Foreground = To-Brush '#E3B341' })
+        [void]$right.Children.Add($st); [void]$right.Children.Add($rb)
+
+        $left = New-Object System.Windows.Controls.StackPanel; $left.VerticalAlignment = 'Center'
+        $lt = New-TB ([string]$d.label) '#E6E8EE' 13
+        $kt = New-TB ("[$sec] $key" + $(if ($d.hint) { '  ·  ' + [string]$d.hint } else { '' })) '#6E7787' 11
+        [void]$left.Children.Add($lt); [void]$left.Children.Add($kt)
+
+        $ctrl = $null
+        switch ([string]$d.type) {
+            'bool' {
+                $ctrl = New-Object System.Windows.Controls.CheckBox
+                $ctrl.IsChecked = ($v -eq 'true'); $ctrl.Tag = @{ K = $k; S = $st }; $ctrl.Margin = (Th 12 0 12 0)
+                $ctrl.Add_Click({ $t = $this.Tag; Set-Edit $t.K $(if ($this.IsChecked) { 'true' } else { 'false' }); $t.S.Text = '已修改'; $t.S.Foreground = To-Brush '#E3B341' })
+            }
+            'enum' {
+                $ctrl = New-Object System.Windows.Controls.WrapPanel; $ctrl.Margin = (Th 12 4 12 0)
+                foreach ($o in @($d.options)) {
+                    if (-not $o) { continue }
+                    $b = New-Object System.Windows.Controls.Button
+                    $b.Style = $script:App.Resources['Pill']; $b.Content = [string]$o.l
+                    $b.Tag = @{ K = $k; V = [string]$o.v; P = $ctrl; S = $st }
+                    $b.Add_Click({ $t = $this.Tag; Set-Edit $t.K $t.V; Paint-Opts $t.P $t.V; $t.S.Text = '已修改'; $t.S.Foreground = To-Brush '#E3B341' })
+                    [void]$ctrl.Children.Add($b)
+                }
+                Paint-Opts $ctrl ([string]$v)
+            }
+            default {
+                $ctrl = New-Object System.Windows.Controls.TextBox
+                $ctrl.Width = 180; $ctrl.Text = [string]$v; $ctrl.Tag = @{ K = $k; S = $st }; $ctrl.Margin = (Th 12 0 12 0)
+                $ctrl.Add_TextChanged({ $t = $this.Tag; Set-Edit $t.K $this.Text; $t.S.Text = '已修改'; $t.S.Foreground = To-Brush '#E3B341' })
+            }
+        }
+        [void]$dp.Children.Add($right)
+        if ([string]$d.type -eq 'enum') {
+            $stack = New-Object System.Windows.Controls.StackPanel
+            [void]$stack.Children.Add($left); [void]$stack.Children.Add($ctrl)
+            [void]$dp.Children.Add($stack)
+        } else {
+            $ctrl.VerticalAlignment = 'Center'
+            [System.Windows.Controls.DockPanel]::SetDock($ctrl, 'Right')
+            [void]$dp.Children.Add($ctrl); [void]$dp.Children.Add($left)
+        }
+        $row.Child = $dp
+        [void]$panel.Children.Add($row)
+    }
+}
+function Test-EmuBusy($emu) {
+    $running = Get-EmuProcesses $emu
+    if ($running.Count -gt 0) { Msg '这个版本正在运行，模拟器退出时会用内存里的设置覆盖文件。请先关闭它再保存。' 'Warning'; return $true }
+    return $false
+}
+function Save-Settings {
+    $st = $script:SetState
+    if (-not $st -or $st.Edits.Count -eq 0) { Set-Status '没有需要保存的修改。'; return }
+    if (Test-EmuBusy $st.Emu) { return }
+    $file = $st.File
+    if ([IO.File]::Exists($file)) { Copy-Item -LiteralPath $file -Destination ($file + '.emumgr.bak') -Force }
+    foreach ($k in @($st.Edits.Keys)) {
+        $i = $k.IndexOf('|'); $sec = $k.Substring(0, $i); $key = $k.Substring($i + 1)
+        $v = [string]$st.Edits[$k]
+        if ($v -eq '__reset__') {
+            if ($st.Game) { Set-IniRaw $file $sec "$key\use_global" 'true' } else { Set-IniRaw $file $sec "$key\default" 'true' }
+        } else {
+            if ($st.Game) { Set-IniRaw $file $sec "$key\use_global" 'false' }
+            Set-IniRaw $file $sec "$key\default" 'false'
+            Set-IniRaw $file $sec $key $v
+        }
+    }
+    Set-Status "已保存 $($st.Edits.Count) 项到 $file（原文件备份为 .emumgr.bak）"
+    Fill-Settings
+}
+function Show-RawConfig {
+    $st = $script:SetState
+    $emu = Get-SelEmu; if (-not $emu) { return }
+    $file = if ($st) { $st.File } else { Expand-T ([string]$emu.Profile.configFile) $emu $null }
+    if (-not $file) { Msg '该模拟器档案没有配置设置文件路径。'; return }
+    $w = New-Dialog ('编辑 — ' + [IO.Path]::GetFileName($file)) 980
+    $w.SizeToContent = 'Manual'; $w.Height = 720; $w.ResizeMode = 'CanResize'
+    $dp = New-Object System.Windows.Controls.DockPanel; $dp.Margin = (Th 16)
+    $top = New-TB $file '#8C95A6' 11; $top.Margin = (Th 0 0 0 8)
+    [System.Windows.Controls.DockPanel]::SetDock($top, 'Top')
+    $tb = New-Object System.Windows.Controls.TextBox
+    $tb.AcceptsReturn = $true; $tb.AcceptsTab = $true; $tb.FontFamily = New-Object System.Windows.Media.FontFamily('Consolas'); $tb.FontSize = 13
+    $tb.VerticalScrollBarVisibility = 'Auto'; $tb.HorizontalScrollBarVisibility = 'Auto'; $tb.VerticalContentAlignment = 'Top'
+    if ([IO.File]::Exists($file)) { $tb.Text = [IO.File]::ReadAllText($file, [Text.Encoding]::UTF8) }
+    $btns = New-DlgButtons $w '保存'
+    [System.Windows.Controls.DockPanel]::SetDock($btns, 'Bottom')
+    [void]$dp.Children.Add($top); [void]$dp.Children.Add($btns); [void]$dp.Children.Add($tb)
+    $w.Content = $dp
+    if ($w.ShowDialog() -eq $true) {
+        if (Test-EmuBusy $emu) { return }
+        $dir = [IO.Path]::GetDirectoryName($file); if (-not [IO.Directory]::Exists($dir)) { [void][IO.Directory]::CreateDirectory($dir) }
+        if ([IO.File]::Exists($file)) { Copy-Item -LiteralPath $file -Destination ($file + '.emumgr.bak') -Force }
+        [IO.File]::WriteAllText($file, $tb.Text, (New-Object Text.UTF8Encoding($false)))
+        Set-Status "已保存 $file（原文件备份为 .emumgr.bak）"
+        Fill-Settings
+    }
+}
+function Backup-Settings {
+    $st = $script:SetState
+    if (-not $st -or -not [IO.File]::Exists($st.File)) { Msg '设置文件不存在。'; return }
+    $g = if ($st.Game) { $st.GameObj } else { [pscustomobject]@{ TitleId = 'GLOBAL'; FolderName = '全局设置'; Dir = '' } }
+    $zip = Backup-Path $st.File $g $st.Emu '模拟器设置'
+    Set-Status "已备份：$zip"
+}
+
 # ================================================================ 事件绑定
 $ui.BtnRescan.Add_Click({ Safe { Rescan } })
 $ui.BtnSettings.Add_Click({ Safe { Do-Settings } })
@@ -2594,9 +2851,25 @@ $ui.BtnRunAgain.Add_Click({
         Set-Status '已载入该次运行的配置，点「启动」即可复现。'
     }
 })
+$ui.BtnSetSave.Add_Click({ Safe { Save-Settings } })
+$ui.BtnSetReload.Add_Click({ Safe { Fill-Settings } })
+$ui.BtnSetRaw.Add_Click({ Safe { Show-RawConfig } })
+$ui.BtnSetBackup.Add_Click({ Safe { Backup-Settings } })
+$ui.BtnSetOpen.Add_Click({ Safe { if ($script:SetState) { Open-InExplorer $script:SetState.File } } })
+$setScope = {
+    Safe {
+        if ($script:SetState -and $script:SetState.Edits.Count -gt 0) {
+            if (-not (Confirm '有未保存的设置修改，切换会丢弃它们。继续吗？')) { return }
+        }
+        Fill-Settings
+    }
+}
+$ui.RbSetGlobal.Add_Checked($setScope)
+$ui.RbSetGame.Add_Checked($setScope)
 $ui.Tabs.Add_SelectionChanged({
     Safe {
         if ($_.OriginalSource -ne $ui.Tabs) { return }
+        if ($ui.Tabs.SelectedIndex -eq 4) { Fill-Settings }
         if ($ui.Tabs.SelectedIndex -eq 1) { Fill-Locations $false }
         if ($ui.Tabs.SelectedIndex -eq 2) { Update-RoomAddr }
     }

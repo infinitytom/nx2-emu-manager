@@ -31,6 +31,11 @@ Eden 系模拟器（Eden、Eglantine / PokeDinner 分支，以及 yuzu / citron 
 - 列出所选版本 × 游戏的存档、着色器缓存、Mods、SDMC、游戏专属配置、日志、keys、固件、NX2 开关文件
 - 打开、打包备份（zip）、清空（先自动备份）、从备份还原、复制到另一个版本（存档会自动适配用户 ID）
 
+### 模拟器设置
+- 在管理器里直接修改所选版本的 **全局设置** 或 **单个游戏的专属设置**（覆盖全局）
+- 常用项（图形 API、分辨率、过滤、抗锯齿、垂直同步、异步着色器、ASTC、主机模式、内存布局、CPU 精度、自动 Stub、日志过滤…）用开关 / 选项按钮修改，可单项「恢复默认 / 跟随全局」
+- 设置项定义在 `profiles.json` 的 `settings` 里，可自行增加；也可直接编辑原始配置文件；保存前自动备份为 `.emumgr.bak`
+
 ### 联机房间
 - 使用版本自带的房间服务器（`eden-room.exe` 等）开房：房间名、端口、人数、密码、首选游戏 / TitleID，可选公开到大厅
 - 实时显示房间日志，一键放行防火墙 UDP 端口，复制局域网地址
@@ -54,7 +59,8 @@ Eden 系模拟器（Eden、Eglantine / PokeDinner 分支，以及 yuzu / citron 
 
 1. 下载或 clone 本仓库，放到任意位置（推荐与模拟器同一个盘，例如 `F:\EmuManager`）
 2. 双击 `EmuManager.bat`
-   - 如果没反应，双击 `EmuManager-debug.bat`，控制台会显示报错
+   - 启动器会先做语法检查，启动失败时弹窗显示原因并写入 `startup-error.log`
+   - 也可以用 `EmuManager-debug.bat`，保留控制台输出
 3. 首次启动默认扫描脚本所在磁盘的根目录；可在右上角「扫描目录」里修改
 
 > 系统要求：Windows 10 / 11（自带 PowerShell 5.1 和 .NET Framework 4.x）。
