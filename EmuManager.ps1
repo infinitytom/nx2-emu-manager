@@ -37,7 +37,7 @@ namespace EmuMgr {
 '@
 }
 
-$script:AppVersion = '2.4.0'
+$script:AppVersion = '2.5.0'
 
 # ================================================================ 路径与持久化
 $script:AppRoot    = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -572,6 +572,55 @@ function Get-NpdmTitleId([string]$npdm) {
         return ([BitConverter]::ToUInt64($b, $aci + 0x10)).ToString('X16')
     } catch { return $null }
 }
+# NUP（Eglantine 2.5+ 的整合包格式）：头部 'NUP\x01'，+0x08 为 TOC 偏移；
+# TOC 'TOC\x01' +0x04 条目数，条目从 TOC+0x30 起、每条 0x40：
+#   +0x00 TitleID(u64)  +0x14 版本(u32)  +0x18 类型(u32，0=基础 1=更新 2=DLC)
+function Get-NupInfo([string]$path) {
+    $fs = $null
+    try {
+        $fs = [IO.File]::OpenRead($path)
+        $b = New-Object byte[] 4096
+        $n = $fs.Read($b, 0, $b.Length)
+        if ($n -lt 0x40 -or [Text.Encoding]::ASCII.GetString($b, 0, 3) -ne 'NUP') { return $null }
+        $toc = [int][BitConverter]::ToUInt32($b, 8)
+        if ($toc -lt 0x10 -or $toc + 0x30 -gt $n -or [Text.Encoding]::ASCII.GetString($b, $toc, 3) -ne 'TOC') { return $null }
+        $cnt = [int][BitConverter]::ToUInt32($b, $toc + 4)
+        $entries = @()
+        for ($i = 0; $i -lt $cnt; $i++) {
+            $o = $toc + 0x30 + $i * 0x40
+            if ($o + 0x1C -gt $n) { break }
+            $entries += [pscustomobject]@{
+                TitleId = ([BitConverter]::ToUInt64($b, $o)).ToString('X16')
+                Version = [int64][BitConverter]::ToUInt32($b, $o + 0x14)
+                Type    = [int][BitConverter]::ToUInt32($b, $o + 0x18)
+            }
+        }
+        if ($entries.Count -eq 0) { return $null }
+        return ,$entries
+    } catch { return $null } finally { if ($fs) { $fs.Dispose() } }
+}
+function Get-NupLabel($entries) {
+    $parts = @()
+    if (@($entries | Where-Object { $_.Type -eq 0 }).Count -gt 0) { $parts += '基础' }
+    foreach ($u in @($entries | Where-Object { $_.Type -eq 1 } | Sort-Object Version)) { $parts += ('更新 v' + [int64][math]::Floor($u.Version / 65536)) }
+    $dlc = @($entries | Where-Object { $_.Type -eq 2 }).Count
+    if ($dlc -gt 0) { $parts += "DLC×$dlc" }
+    return 'NUP（' + ($parts -join ' + ') + '）'
+}
+# 检测模拟器是否能加载 NUP：在 exe 里找 NUP 加载器特征字符串，结果按 exe 路径+修改时间缓存
+$script:NupSupportCache = @{}
+function Test-EmuNupSupport([string]$exe) {
+    if (-not $exe -or -not [IO.File]::Exists($exe)) { return $false }
+    $k = $exe.ToLower() + '|' + [IO.File]::GetLastWriteTimeUtc($exe).Ticks
+    if ($script:NupSupportCache.ContainsKey($k)) { return $script:NupSupportCache[$k] }
+    $ok = $false
+    try {
+        $txt = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($exe))
+        $ok = ($txt.Contains('NUP zstd') -or $txt.Contains('ConvertToNup'))
+    } catch { }
+    $script:NupSupportCache[$k] = $ok
+    return $ok
+}
 function Get-GameNameFromPath([string]$path) {
     $q = $path
     while ($q) {
@@ -582,7 +631,7 @@ function Get-GameNameFromPath([string]$path) {
     }
     return $path
 }
-function Add-GameContent($found, [string]$tid, [string]$path, [string]$type) {
+function Add-GameContent($found, [string]$tid, [string]$path, [string]$type, [string]$labelOverride = '') {
     $kind = 'base'; $baseTid = $tid; $label = '基础'
     if ($type -eq 'file' -and $tid -notlike 'FILE:*') {
         $v = [Convert]::ToUInt64($tid, 16)
@@ -598,6 +647,7 @@ function Add-GameContent($found, [string]$tid, [string]$path, [string]$type) {
             if ($leaf -match '^\d+$') { $label = '更新 v' + [int64][math]::Floor([int64]$leaf / 65536) + " ($leaf)" }
         }
     }
+    if ($labelOverride) { $label = $labelOverride }
     if (-not $found.ContainsKey($baseTid)) {
         $name = if ($type -eq 'file') { ([IO.Path]::GetFileNameWithoutExtension($path) -replace '\[[^\]]*\]', '').Trim() } else { Get-GameNameFromPath $path }
         $found[$baseTid] = [pscustomobject]@{ TitleId = $baseTid; FolderName = $name; Contents = (New-Object System.Collections.ArrayList); Dir = '' }
@@ -625,6 +675,21 @@ function Scan-Games {
             $files = @(); try { $files = [IO.Directory]::GetFiles($p) } catch { }
             foreach ($f in $files) {
                 $ext = [IO.Path]::GetExtension($f).ToLower()
+                if ($ext -eq '.nup') {
+                    $nup = Get-NupInfo $f
+                    if ($nup) {
+                        $main = @($nup | Where-Object { $_.Type -eq 0 }) | Select-Object -First 1
+                        if (-not $main) { $main = $nup[0] }
+                        $tid = [string]$main.TitleId
+                        if ($main.Type -eq 1) { $tid = $tid.Substring(0, 13) + '800' }
+                        Add-GameContent $found $tid $f 'file' (Get-NupLabel $nup)
+                    } else {
+                        $m = [regex]::Match([IO.Path]::GetFileName($f), '([0-9A-Fa-f]{16})')
+                        $tid = if ($m.Success) { $m.Groups[1].Value.ToUpper() } else { 'FILE:' + $f }
+                        Add-GameContent $found $tid $f 'file' 'NUP'
+                    }
+                    continue
+                }
                 if (@('.nsp', '.xci', '.nsz', '.xcz') -contains $ext) {
                     $m = [regex]::Match([IO.Path]::GetFileName($f), '([0-9A-Fa-f]{16})')
                     $tid = if ($m.Success) { $m.Groups[1].Value.ToUpper() } else { 'FILE:' + $f }
@@ -1906,6 +1971,9 @@ function Start-Run {
     $useCli = [bool]$ui.RbCli.IsChecked
     $exe = if ($useCli) { $emu.Cli } else { $emu.Gui }
     if (-not $exe) { Msg '这个版本没有所选的前端。'; return }
+    if ([IO.Path]::GetExtension($target) -ieq '.nup' -and -not (Test-EmuNupSupport $exe)) {
+        if (-not (Confirm "「$(Emu-Display $emu)」看起来不支持 .nup 格式（需要 Eglantine 2.5.0 或更新的版本）。仍要启动吗？")) { return }
+    }
     $same = @($script:Running | Where-Object { $_.DataDir -ieq $emu.DataDir })
     if ($same.Count -gt 0) {
         if (-not (Confirm "已有一个使用同一数据目录的实例在运行（$($same[0].EmuName)），同时运行可能互相覆盖存档/着色器。仍要启动吗？")) { return }
@@ -3103,7 +3171,7 @@ $ui.BtnBrowseTarget.Add_Click({
     Safe {
         $g = Get-SelGame; if (-not $g) { return }
         $dlg = New-Object Microsoft.Win32.OpenFileDialog
-        $dlg.Filter = '游戏文件 (main, nsp, xci, nca, nro)|main;*.nsp;*.xci;*.nca;*.nro;*.nso;*.nsz;*.xcz|所有文件|*.*'
+        $dlg.Filter = '游戏文件 (main, nsp, xci, nup, nca, nro)|main;*.nsp;*.xci;*.nup;*.nca;*.nro;*.nso;*.nsz;*.xcz|所有文件|*.*'
         if ($g.Dir) { $dlg.InitialDirectory = $g.Dir }
         if ($dlg.ShowDialog($win) -eq $true) {
             if (-not $script:Db.games.ContainsKey($g.TitleId)) { $script:Db.games[$g.TitleId] = @{} }

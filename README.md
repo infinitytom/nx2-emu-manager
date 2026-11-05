@@ -14,7 +14,7 @@ Eden 系模拟器（Eden、Eglantine / PokeDinner 分支，以及 yuzu / citron 
 ### 版本与游戏识别
 - 扫描磁盘找出所有模拟器目录，读取 `VERSION.txt` / `BUILD-INFO.txt` / 压缩包文件名中的 **分支和 commit**
 - 识别数据目录：版本目录里有 `user\` = 独立数据；否则使用 `%APPDATA%\eden`（共享），会自动跟随目录链接（junction / 符号链接）找到真实位置，默认位置没有数据时会在各盘查找 `X:\eden`、`X:\eden\eden`；也可以手动「更改数据目录」（单个版本或所有共享版本）
-- 识别游戏：解包目录（从 `exefs\main.npdm` 读取 TitleID）以及 nsp / xci；`updates\<版本号>` 自动识别为更新
+- 识别游戏：解包目录（从 `exefs\main.npdm` 读取 TitleID）以及 nsp / xci / nup（Eglantine 2.5+ 整合包，直接读文件头里的 TitleID 和所含更新版本）；`updates\<版本号>` 自动识别为更新
 - **游戏封面**：扫描后在后台按 TitleID 从任天堂官网（欧洲站，含 Switch 2 游戏）自动下载方形官方封面并补全官方名称；查不到时可按名字搜索、从缩略图里挑选，或自己选择图片 / 从剪贴板粘贴。也会使用游戏目录里的 `cover`/`icon` 图片和模拟器游戏列表缓存的图标
 - **导入 zip**：新构建解压到独立目录，多个版本并存，可一键设为独立数据
 - **隔离数据**：把共享 `%APPDATA%` 的版本转为独立 `user\` 目录（自动复制 keys / 固件 / 存档）
